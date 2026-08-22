@@ -8,6 +8,7 @@ import {
 } from '../../shared/chat.js';
 
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export async function onRequest(context) {
   const { request } = context;
@@ -21,11 +22,15 @@ export async function onRequest(context) {
   if (method !== 'GET') {
     const origin = request.headers.get('Origin');
     if (origin && origin !== url.origin) return apiError(403, 'Cross-site request rejected.');
+    const fetchSite = request.headers.get('Sec-Fetch-Site');
+    if (fetchSite && !['same-origin', 'none'].includes(fetchSite)) return apiError(403, 'Cross-site request rejected.');
   }
 
   try {
     if (method === 'GET' && parts[0] === 'messages') {
       validateSearch(url.searchParams.get('q') || '');
+      const cursor = url.searchParams.get('cursor');
+      if (cursor && cursor.length > 256) throw new Error('Cursor is too long.');
     }
 
     if (method !== 'GET' && expectsJson(method, parts)) {
@@ -46,7 +51,7 @@ export async function onRequest(context) {
 export function routeAllowed(method, parts) {
   if (parts[0] === 'auth' && parts.length === 2) {
     if (parts[1] === 'me') return method === 'GET';
-    if (['bootstrap', 'register', 'login', 'logout'].includes(parts[1])) return method === 'POST';
+    if (['bootstrap', 'register', 'login', 'logout', 'logout-all', 'logout-others', 'change-password'].includes(parts[1])) return method === 'POST';
     return false;
   }
 
@@ -57,16 +62,26 @@ export function routeAllowed(method, parts) {
     return false;
   }
 
+  if (parts[0] === 'members') {
+    if (parts.length === 1) return method === 'GET';
+    if (parts.length === 3 && MESSAGE_ID_RE.test(parts[1]) && parts[2] === 'disable') return method === 'POST' || method === 'DELETE';
+    return false;
+  }
+
+  if (parts[0] === 'invites') {
+    if (parts.length === 1) return method === 'GET' || method === 'POST';
+    if (parts.length === 2 && INVITE_ID_RE.test(parts[1])) return method === 'DELETE';
+    return false;
+  }
+
   if (parts.length !== 1) return false;
-  if (parts[0] === 'members') return method === 'GET';
-  if (['reactions', 'read', 'invites'].includes(parts[0])) return method === 'POST';
+  if (['reactions', 'read'].includes(parts[0])) return method === 'POST';
   return false;
 }
 
 function expectsJson(method, parts) {
-  if (method === 'DELETE') return false;
-  if (parts[0] === 'auth' && parts[1] === 'logout') return true;
-  if (parts[0] === 'members') return false;
+  if (method === 'DELETE' || method === 'GET') return false;
+  if (parts[0] === 'members' && parts[2] === 'disable') return false;
   return method === 'POST' || method === 'PATCH';
 }
 
@@ -74,7 +89,14 @@ function validatePayload(method, parts, body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('JSON body must be an object.');
 
   if (parts[0] === 'auth') {
-    if (parts[1] === 'logout') return;
+    if (['logout', 'logout-all', 'logout-others'].includes(parts[1])) return;
+    if (parts[1] === 'change-password') {
+      const current = String(body.currentPassword ?? '');
+      if (current.length < 1 || current.length > 128) throw new Error('Invalid current password.');
+      validatePassword(body.newPassword);
+      if (current === String(body.newPassword ?? '')) throw new Error('New password must be different.');
+      return;
+    }
     validateUsername(body.username);
     if (parts[1] === 'login') {
       const password = String(body.password ?? '');
@@ -126,6 +148,7 @@ function apiError(status, message) {
       'Cache-Control': 'no-store',
       'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
       'Referrer-Policy': 'no-referrer',
+      'Strict-Transport-Security': 'max-age=31536000',
       'X-Content-Type-Options': 'nosniff',
     },
   });
