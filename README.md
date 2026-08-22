@@ -13,6 +13,7 @@ References:
 
 - Family-only authentication with username + password.
 - First-user bootstrap protected by a server-side `FAMILY_SETUP_SECRET`.
+- Exactly one owner enforced at the database level.
 - Owner-generated, single-use invite codes that expire after 24 hours.
 - PBKDF2-SHA256 password hashing with a random salt per user.
 - 30-day HttpOnly + Secure + SameSite=Strict session cookies.
@@ -23,12 +24,13 @@ References:
 - Delete your own messages; the family owner may delete any message.
 - Owner-only message pinning.
 - Search across visible messages.
-- Read markers / aggregate seen count.
+- Read markers / aggregate seen count with server/database clamping.
 - Family member list.
 - Message send throttling and login-attempt throttling.
+- Explicit API route/method allowlisting and request validation.
 - Responsive phone/desktop interface.
 - Installable PWA shell.
-- Service worker explicitly excludes `/api/` from caching.
+- Service worker explicitly excludes `/api/` from caching and uses network-first static updates.
 - No external analytics, ads, trackers, recommendation model, or public profile system.
 
 ## Architecture
@@ -43,6 +45,7 @@ Browser
           │
           ▼
 Cloudflare Pages Functions
+  ├─ functions/api/_middleware.js
   └─ functions/api/[[path]].js
           │
           ▼
@@ -69,9 +72,11 @@ The timeline path follows a simple pipeline:
 
 This is conceptually similar to the pipeline decomposition documented by X/Twitter, but the implementation here is original and much smaller.
 
-## Security model
+## Security and privacy model
 
 This repository may be public. **Family message content and credentials are not stored in GitHub.** Runtime data lives in D1.
+
+Family S is **not end-to-end encrypted**. Message bodies are stored as plaintext in the configured D1 database so the server can perform search, reply context, and timeline queries. Anyone with sufficient Cloudflare/D1 administrative access may be able to read that data. Use a trusted Cloudflare account, enable strong account security, and do not treat Family S as a zero-knowledge messenger.
 
 ### Secrets
 
@@ -92,15 +97,31 @@ Store it as a Cloudflare encrypted secret / environment secret. Do not place it 
 - Session cookie: `HttpOnly; Secure; SameSite=Strict`.
 - Invite codes: random 192-bit value; only its SHA-256 hash is stored in D1.
 - Setup secret comparison is performed through fixed-size digests.
+- A partial unique index permits only one `owner` row, closing concurrent-bootstrap races.
 - Mutating browser requests reject cross-origin `Origin` values.
 - Login attempts are limited per hashed IP+username bucket.
 - Message send bursts are limited per user.
+- API middleware allows only explicit routes/methods and validates message IDs and payload types before the main handler.
+- Invalid client input is rejected as a 4xx response rather than leaking into generic server errors.
+- Read markers are validated against the current time and also clamped in D1 to an existing visible message timestamp.
 
 ### Browser hardening
 
 `_headers` sets CSP, frame denial, referrer restrictions, nosniff, COOP, and disables unnecessary browser permissions.
 
-The service worker never caches `/api/` requests or responses.
+The service worker never caches `/api/` requests or responses. Static assets are network-first so an old cached JavaScript bundle does not indefinitely override a newer deployed client.
+
+## Review fixes applied before merge
+
+The pre-merge review found and fixed these issues:
+
+1. concurrent first-user requests could theoretically create multiple owners — fixed with a D1 unique owner constraint;
+2. a modified client could submit a future read timestamp — fixed with middleware validation plus database triggers that clamp reads to real message timestamps;
+3. catch-all message routes accepted ambiguous subpaths — fixed with an exact route/method allowlist and UUID validation;
+4. the first service-worker design was cache-first for static JavaScript and could retain stale client code — changed to network-first with stale-cache cleanup;
+5. oversized login passwords could reach expensive password derivation — bounded before the authentication handler;
+6. shared validators throw ordinary errors, which could otherwise become HTTP 500 — middleware now performs validation and converts bad requests into 4xx responses;
+7. pin requests could coerce string values such as `"false"` to true — middleware now requires a real boolean.
 
 ## Cloudflare Pages deployment
 
@@ -131,13 +152,13 @@ Do not commit the value.
 The project is static and does not require a build step.
 
 - Build command: leave empty (or run `npm run check`)
-- Build output directory: `/`
+- Static output: repository root (`.`)
 
 Cloudflare Pages deploys the `functions/` directory automatically.
 
 ### 5. Initialize the family
 
-Open the deployed site, select **初回設定**, and enter the same `FAMILY_SETUP_SECRET` once to create the owner account. After one user exists, the bootstrap endpoint refuses additional initialization.
+Open the deployed site, select **初回設定**, and enter the same `FAMILY_SETUP_SECRET` once to create the owner account. The database also enforces that only one owner may exist.
 
 The owner can then create one-time invitation codes from the app.
 
@@ -155,7 +176,7 @@ For Cloudflare-local development, copy `.dev.vars.example` to `.dev.vars` and re
 
 ## Tests
 
-The current unit tests cover:
+The current suite has 11 unit tests covering:
 
 - username normalization/validation;
 - display-name and password bounds;
@@ -164,13 +185,15 @@ The current unit tests cover:
 - opaque cursor round-trip/rejection;
 - timeline deduplication and chronological ordering;
 - page-size clamping;
-- reaction summary/current-user state.
+- reaction summary/current-user state;
+- strict message route allowlisting;
+- rejection of wrong authentication methods and unknown routes.
 
 CI additionally performs JavaScript syntax checks, manifest parsing, and secret scanning.
 
 ## Important deployment limitation
 
-The repository review can validate the implementation and CI, but it cannot prove a live Cloudflare D1 deployment until the target Cloudflare account is configured and the application is exercised there. Treat live multi-device behavior as a separate deployment verification step.
+Repository review and GitHub Actions validate the implementation, but a live Cloudflare D1 deployment has not been exercised from multiple real family devices in the target account. Live authentication, D1 schema application, mobile PWA install, and multi-device polling should be verified after deployment.
 
 ## Project structure
 
@@ -188,6 +211,7 @@ Family_S/
 │  └─ chat.js
 ├─ functions/
 │  └─ api/
+│     ├─ _middleware.js
 │     └─ [[path]].js
 ├─ scripts/
 │  └─ check-secrets.mjs
