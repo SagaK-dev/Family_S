@@ -14,6 +14,7 @@ import {
   validateUsername,
 } from '../shared/chat.js';
 import { routeAllowed } from '../functions/api/_middleware.js';
+import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from '../functions/api/[[path]].js';
 
 test('normalizes and validates usernames', () => {
   assert.equal(normalizeUsername('  Family_1 '), 'family_1');
@@ -50,6 +51,7 @@ test('cursor round trips timestamp and message id', () => {
   const encoded = encodeCursor({ createdAt: 1720000000000, id: 'abc-123' });
   assert.deepEqual(decodeCursor(encoded), { createdAt: 1720000000000, id: 'abc-123' });
   assert.equal(decodeCursor('not valid!'), null);
+  assert.equal(decodeCursor('A'.repeat(257)), null);
 });
 
 test('timeline pipeline removes duplicates and hidden rows, then orders chronologically', () => {
@@ -93,9 +95,39 @@ test('API middleware allows only explicit message routes', () => {
   assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
 });
 
-test('API middleware rejects wrong auth methods and unknown routes', () => {
+test('API middleware exposes hardened auth session controls only by POST', () => {
+  for (const action of ['login', 'logout', 'logout-all', 'logout-others', 'change-password']) {
+    assert.equal(routeAllowed('POST', ['auth', action]), true);
+    assert.equal(routeAllowed('GET', ['auth', action]), false);
+  }
   assert.equal(routeAllowed('GET', ['auth', 'me']), true);
-  assert.equal(routeAllowed('POST', ['auth', 'login']), true);
-  assert.equal(routeAllowed('GET', ['auth', 'login']), false);
   assert.equal(routeAllowed('POST', ['admin']), false);
+});
+
+test('API middleware restricts member disable and invitation revocation routes', () => {
+  const memberId = '123e4567-e89b-42d3-a456-426614174000';
+  const inviteId = 'A'.repeat(43);
+  assert.equal(routeAllowed('GET', ['members']), true);
+  assert.equal(routeAllowed('POST', ['members', memberId, 'disable']), true);
+  assert.equal(routeAllowed('DELETE', ['members', memberId, 'disable']), true);
+  assert.equal(routeAllowed('POST', ['members', memberId, 'other']), false);
+  assert.equal(routeAllowed('GET', ['invites']), true);
+  assert.equal(routeAllowed('POST', ['invites']), true);
+  assert.equal(routeAllowed('DELETE', ['invites', inviteId]), true);
+  assert.equal(routeAllowed('DELETE', ['invites', 'short']), false);
+});
+
+test('password hash parser supports legacy upgrade and current 600k format', () => {
+  const legacy = parsePasswordHash('A'.repeat(43));
+  assert.equal(legacy.iterations, 240_000);
+  assert.equal(legacy.needsUpgrade, true);
+  const current = parsePasswordHash(`pbkdf2-sha256$${PBKDF2_ITERATIONS}$${'B'.repeat(43)}`);
+  assert.equal(PBKDF2_ITERATIONS, 600_000);
+  assert.equal(current.iterations, 600_000);
+  assert.equal(current.needsUpgrade, false);
+  assert.throws(() => parsePasswordHash('pbkdf2-sha256$99999999$' + 'C'.repeat(43)));
+});
+
+test('session cookie uses the host-only security prefix', () => {
+  assert.equal(SESSION_COOKIE, '__Host-family_s_session');
 });
