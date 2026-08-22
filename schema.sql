@@ -59,6 +59,24 @@ CREATE TABLE IF NOT EXISTS reads (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_reads_clamp_insert
+AFTER INSERT ON reads
+WHEN NEW.last_message_at > COALESCE((SELECT MAX(created_at) FROM messages WHERE deleted_at IS NULL), 0)
+BEGIN
+  UPDATE reads
+  SET last_message_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE deleted_at IS NULL), 0)
+  WHERE user_id = NEW.user_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_reads_clamp_update
+AFTER UPDATE OF last_message_at ON reads
+WHEN NEW.last_message_at > COALESCE((SELECT MAX(created_at) FROM messages WHERE deleted_at IS NULL), 0)
+BEGIN
+  UPDATE reads
+  SET last_message_at = COALESCE((SELECT MAX(created_at) FROM messages WHERE deleted_at IS NULL), 0)
+  WHERE user_id = NEW.user_id;
+END;
+
 CREATE TABLE IF NOT EXISTS auth_limits (
   bucket_hash TEXT PRIMARY KEY,
   attempts INTEGER NOT NULL,
