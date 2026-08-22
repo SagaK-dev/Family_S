@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Family S">
+  <rect width="512" height="512" rx="112" fill="#13251f"/>
+  <path d="M104 245 256 122l152 123v151a28 28 0 0 1-28 28H132a28 28 0 0 1-28-28Z" fill="#e4f1eb"/>
+  <circle cx="206" cy="276" r="46" fill="#2f6f58"/>
+  <circle cx="306" cy="276" r="46" fill="#2f6f58"/>
+  <path d="M164 382c12-52 48-78 92-78s80 26 92 78" fill="#2f6f58"/>
+</svg>

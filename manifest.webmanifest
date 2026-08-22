@@ -1,0 +1,14 @@
+{
+  "name": "Family S",
+  "short_name": "Family S",
+  "description": "Private family-only chat",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f7faf8",
+  "theme_color": "#13251f",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
