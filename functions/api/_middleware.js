@@ -9,9 +9,10 @@ import {
 
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
 
 export async function onRequest(context) {
-  const { request } = context;
+  const { request, env } = context;
   const url = new URL(request.url);
   const parts = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
   const method = request.method.toUpperCase();
@@ -27,6 +28,12 @@ export async function onRequest(context) {
   }
 
   try {
+    if (method === 'POST' && parts[0] === 'auth' && parts[1] === 'bootstrap' && env?.FAMILY_DB) {
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+      const bucket = await sha256Hex(`bootstrap\n${ip}`);
+      await consumeBootstrapAttempt(env.FAMILY_DB, bucket);
+    }
+
     if (method === 'GET' && parts[0] === 'messages') {
       validateSearch(url.searchParams.get('q') || '');
       const cursor = url.searchParams.get('cursor');
@@ -41,6 +48,7 @@ export async function onRequest(context) {
       }
     }
   } catch (error) {
+    if (error?.rateLimited) return apiError(429, 'Too many setup attempts. Try again later.');
     if (parts[0] === 'auth' && parts[1] === 'login') return apiError(401, 'Invalid username or password.');
     return apiError(400, error instanceof Error ? error.message : 'Invalid request.');
   }
@@ -138,6 +146,27 @@ function validatePayload(method, parts, body) {
     const value = Number(body.lastMessageAt);
     if (!Number.isSafeInteger(value) || value < 0 || value > Date.now()) throw new Error('Invalid read marker.');
   }
+}
+
+async function consumeBootstrapAttempt(db, bucket) {
+  const now = Date.now();
+  const row = await db.prepare(`
+    INSERT INTO auth_limits (bucket_hash, attempts, window_started_at) VALUES (?, 1, ?)
+    ON CONFLICT(bucket_hash) DO UPDATE SET
+      attempts = CASE WHEN auth_limits.window_started_at + ? <= ? THEN 1 ELSE auth_limits.attempts + 1 END,
+      window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
+    RETURNING attempts`)
+    .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
+  if (Number(row?.attempts || 0) > 10) {
+    const error = new Error('Rate limited');
+    error.rateLimited = true;
+    throw error;
+  }
+}
+
+async function sha256Hex(value) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)));
+  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function apiError(status, message) {
