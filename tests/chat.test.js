@@ -13,6 +13,7 @@ import {
   validateSearch,
   validateUsername,
 } from '../shared/chat.js';
+import { routeAllowed } from '../functions/api/_middleware.js';
 
 test('normalizes and validates usernames', () => {
   assert.equal(normalizeUsername('  Family_1 '), 'family_1');
@@ -80,4 +81,21 @@ test('reaction summary counts reactions and marks current-user state', () => {
   const thumbs = summary.m1.find(item => item.emoji === '👍');
   assert.deepEqual(thumbs, { emoji: '👍', count: 2, reacted: true });
   assert.equal(summary.m1.some(item => item.emoji === '🔥'), false);
+});
+
+test('API middleware allows only explicit message routes', () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  assert.equal(routeAllowed('GET', ['messages']), true);
+  assert.equal(routeAllowed('POST', ['messages']), true);
+  assert.equal(routeAllowed('PATCH', ['messages', id]), true);
+  assert.equal(routeAllowed('POST', ['messages', id, 'pin']), true);
+  assert.equal(routeAllowed('PATCH', ['messages', id, 'unexpected']), false);
+  assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
+});
+
+test('API middleware rejects wrong auth methods and unknown routes', () => {
+  assert.equal(routeAllowed('GET', ['auth', 'me']), true);
+  assert.equal(routeAllowed('POST', ['auth', 'login']), true);
+  assert.equal(routeAllowed('GET', ['auth', 'login']), false);
+  assert.equal(routeAllowed('POST', ['admin']), false);
 });
