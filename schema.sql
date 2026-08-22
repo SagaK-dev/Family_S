@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS blocked_users (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  disabled_at INTEGER NOT NULL,
+  disabled_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_users_disabled_at ON blocked_users(disabled_at);
+
 CREATE TABLE IF NOT EXISTS invites (
   code_hash TEXT PRIMARY KEY,
   created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
