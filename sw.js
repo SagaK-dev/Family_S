@@ -1,4 +1,4 @@
-const CACHE = 'family-s-v1';
+const CACHE = 'family-s-v2';
 const STATIC = ['./','./index.html','./styles.css','./app.js','./shared/chat.js','./manifest.webmanifest','./icon.svg'];
 
 self.addEventListener('install', event => {
@@ -15,16 +15,19 @@ self.addEventListener('fetch', event => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
 
-  if (request.mode === 'navigate') {
-    event.respondWith(fetch(request).then(response => {
-      if (response.ok) caches.open(CACHE).then(cache => cache.put('./index.html', response.clone()));
-      return response;
-    }).catch(() => caches.match('./index.html')));
-    return;
-  }
-
-  event.respondWith(caches.match(request).then(cached => cached || fetch(request).then(response => {
-    if (response.ok && response.type === 'basic') caches.open(CACHE).then(cache => cache.put(request, response.clone()));
-    return response;
-  })));
+  event.respondWith(networkFirst(request));
 });
+
+async function networkFirst(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok && response.type === 'basic') {
+      const cache = await caches.open(CACHE);
+      await cache.put(request.mode === 'navigate' ? './index.html' : request, response.clone());
+    }
+    return response;
+  } catch {
+    if (request.mode === 'navigate') return (await caches.match('./index.html')) || Response.error();
+    return (await caches.match(request)) || Response.error();
+  }
+}
