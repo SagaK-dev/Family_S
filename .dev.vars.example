@@ -1,0 +1,3 @@
+# Copy to .dev.vars for local development only.
+# Never commit the real value.
+FAMILY_SETUP_SECRET=replace-with-a-long-random-secret
