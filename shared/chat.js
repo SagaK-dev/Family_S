@@ -48,8 +48,10 @@ export function encodeCursor(message) {
 
 export function decodeCursor(value) {
   if (!value) return null;
+  const encoded = String(value);
+  if (encoded.length > 256) return null;
   try {
-    const parsed = JSON.parse(base64UrlDecode(String(value)));
+    const parsed = JSON.parse(base64UrlDecode(encoded));
     if (!Array.isArray(parsed) || parsed.length !== 2) return null;
     const [createdAt, id] = parsed;
     if (!Number.isSafeInteger(createdAt) || typeof id !== 'string' || id.length < 1 || id.length > 80) return null;
@@ -100,7 +102,6 @@ function base64UrlEncode(text) {
 
 function base64UrlDecode(text) {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) throw new Error('Bad cursor');
-  if (typeof Buffer !== 'undefined') return Buffer.from(text, 'base64url').toString('utf8');
   const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - text.length % 4) % 4);
   const binary = atob(padded);
   const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
