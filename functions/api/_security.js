@@ -1,6 +1,7 @@
-import { SESSION_COOKIE, parsePasswordHash } from './[[path]].js';
+import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from './[[path]].js';
 
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const SESSION_SECONDS = 60 * 60 * 24 * 30;
 
 export async function requirePilotUser(request, db) {
   const token = cookieValue(request, SESSION_COOKIE);
@@ -21,12 +22,20 @@ export async function verifyPilotPassword(password, user) {
   try {
     const parsed = parsePasswordHash(user.password_hash);
     const salt = base64UrlToBytes(user.password_salt);
-    const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(value), 'PBKDF2', false, ['deriveBits']);
-    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: parsed.iterations }, keyMaterial, 256);
-    return constantTimeAscii(bytesToBase64Url(new Uint8Array(bits)), parsed.digest);
+    const digest = await derivePassword(value, salt, parsed.iterations);
+    return constantTimeAscii(digest, parsed.digest);
   } catch {
     return false;
   }
+}
+
+export async function hashPilotPassword(password) {
+  const value = String(password || '');
+  if (value.length < 10 || value.length > 128) throw new PilotHttpError(400, 'Password must be 10–128 characters.');
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const salt = bytesToBase64Url(saltBytes);
+  const digest = await derivePassword(value, saltBytes, PBKDF2_ITERATIONS);
+  return { salt, hash: `pbkdf2-sha256$${PBKDF2_ITERATIONS}$${digest}` };
 }
 
 export async function consumeSensitiveAttempt(request, db, userId, action, limit = 8) {
@@ -46,6 +55,17 @@ export async function consumeSensitiveAttempt(request, db, userId, action, limit
 
 export async function clearSensitiveAttempt(db, bucket) {
   await db.prepare('DELETE FROM auth_limits WHERE bucket_hash = ?').bind(bucket).run();
+}
+
+export async function createPilotSession(db, userId) {
+  const token = `v2.${randomToken(32)}`;
+  const tokenHash = await sha256Text(token);
+  const createdAt = Date.now();
+  const expiresAt = createdAt + SESSION_SECONDS * 1000;
+  await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').bind(createdAt).run();
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .bind(tokenHash, userId, createdAt, expiresAt).run();
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_SECONDS}`;
 }
 
 export async function recordAudit(db, eventType, actorUserId = null, subjectUserId = null) {
@@ -91,6 +111,12 @@ export function handlePilotError(error, request) {
   return pilotJson({ error: 'Unexpected server error.' }, 500);
 }
 
+async function derivePassword(password, saltBytes, iterations) {
+  const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: saltBytes, iterations }, keyMaterial, 256);
+  return bytesToBase64Url(new Uint8Array(bits));
+}
+
 async function sha256Text(value) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value)));
   return bytesToBase64Url(new Uint8Array(digest));
@@ -104,6 +130,10 @@ function cookieValue(request, name) {
     if (part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
   }
   return null;
+}
+
+function randomToken(bytes) {
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
 function base64UrlToBytes(value) {
