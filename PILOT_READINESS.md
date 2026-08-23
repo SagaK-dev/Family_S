@@ -30,10 +30,11 @@ Do not invite external pilot households until every item below has been checked 
 3. Configure a long random `FAMILY_SETUP_SECRET` as an encrypted Cloudflare secret.
 4. Enable MFA on the Cloudflare account and restrict administrative access to the minimum necessary people.
 5. Confirm HTTPS-only access and that the application is served from the intended hostname.
-6. Tail Pages Functions logs during the smoke test and confirm there are no 1102 CPU-limit errors, uncaught exceptions, or D1 overloaded errors.
-7. Profile login, registration, and password change with production-like data. The application intentionally keeps PBKDF2-HMAC-SHA256 at 600,000 iterations. Workers Free has a 10 ms CPU limit per HTTP request, so use Workers Paid for the pilot unless measurements in the actual environment demonstrate that the current authentication path is reliable.
-8. Confirm the daily request count stays comfortably below the applicable plan limit. The source-level budget test models 3 users active for 4 hours at about 5,046 idle-refresh requests, before user-generated actions.
-9. Enable GitHub secret scanning/push protection where available and protect `main` with required CI checks. The repository code cannot enable these account/repository settings by itself.
+6. Confirm `GET /api/health` returns HTTP 200 and `{"ok":true,"schema":"pilot-v1"}`.
+7. Tail Pages Functions logs during the smoke test and confirm there are no 1102 CPU-limit errors, uncaught exceptions, or D1 overloaded errors.
+8. Profile login, registration, and password change with production-like data. The application intentionally keeps PBKDF2-HMAC-SHA256 at 600,000 iterations. Workers Free has a 10 ms CPU limit per HTTP request, so use Workers Paid for the pilot unless measurements in the actual environment demonstrate that the current authentication path is reliable.
+9. Confirm the daily request count stays comfortably below the applicable plan limit. The source-level budget test models 3 users active for 4 hours at about 5,046 idle-refresh requests, before user-generated actions.
+10. Enable GitHub secret scanning/push protection where available and protect `main` with required CI checks. The repository code cannot enable these account/repository settings by itself.
 
 Cloudflare references:
 
@@ -66,6 +67,34 @@ Use at least two separate devices/browsers and test both the owner and a member 
 - use “logout all devices” and verify every session is rejected
 - change the password and verify old sessions and the old password no longer work
 - leave the chat visible for at least 30 minutes and confirm polling remains stable without request spikes
+
+## Participant withdrawal and data deletion
+
+For a limited pilot, withdrawal is an operator-controlled procedure. Record the participant's stable D1 user ID when onboarding so deletion does not depend only on a display name.
+
+Before deletion, explain the effect to the participant: deleting a member row also removes that member's authored messages, sessions, reactions, read marker, and blocked-member entry through the current foreign-key cascade rules. Reply links from surviving messages become empty where the referenced message was removed.
+
+Use a staging copy first and verify the target is a `member`, never the sole `owner`:
+
+```sql
+SELECT id, username, role FROM users WHERE id = 'PARTICIPANT_UUID';
+```
+
+After confirming the ID and role, delete the participant:
+
+```sql
+DELETE FROM users WHERE id = 'PARTICIPANT_UUID' AND role = 'member';
+```
+
+Then confirm:
+
+- the deleted member cannot authenticate
+- their sessions are absent
+- their authored messages and reactions are absent
+- the remaining family timeline still renders correctly
+- no unrelated family member was affected
+
+Do not promise immediate deletion from Cloudflare's underlying disaster-recovery history. D1 Time Travel may retain a restorable historical database state for the plan's retention window. Pilot consent/privacy text should disclose the operational retention policy accurately.
 
 ## Recovery drill
 
@@ -100,4 +129,4 @@ If a security or data-integrity incident occurs during the pilot:
 
 ## Pilot go/no-go rule
 
-A family-internal alpha can run after CI passes. External households should only be invited after the Cloudflare deployment gates, multi-device smoke test, and recovery drill above have all passed and the results have been recorded.
+A family-internal alpha can run after CI passes. External households should only be invited after the Cloudflare deployment gates, multi-device smoke test, participant-withdrawal procedure, and recovery drill above have all passed and the results have been recorded.
