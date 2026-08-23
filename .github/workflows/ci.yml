@@ -19,5 +19,6 @@ jobs:
           node-version: 22
       - run: npm test
       - run: npm run check
+      - run: npm run benchmark:password
       - run: npm run security:check
       - run: npm run security:history

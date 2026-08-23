@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildReactionSummary,
+  buildSearchPattern,
   decodeCursor,
+  D1_LIKE_PATTERN_MAX_BYTES,
   encodeCursor,
   normalizeUsername,
   runTimelinePipeline,
@@ -13,6 +15,12 @@ import {
   validateSearch,
   validateUsername,
 } from '../shared/chat.js';
+import {
+  MEMBER_POLL_EVERY,
+  MESSAGE_POLL_MS,
+  estimateIdleRequests,
+  shouldSendReadMarker,
+} from '../shared/pilot.js';
 import { routeAllowed } from '../functions/api/_middleware.js';
 import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from '../functions/api/[[path]].js';
 
@@ -36,9 +44,14 @@ test('message validation trims content without allowing empty messages', () => {
   assert.throws(() => validateMessage('x'.repeat(2001)));
 });
 
-test('search validation enforces a bounded query', () => {
+test('search validation respects D1 LIKE pattern byte limit', () => {
   assert.equal(validateSearch('  dinner  '), 'dinner');
-  assert.throws(() => validateSearch('x'.repeat(101)));
+  assert.equal(validateSearch('x'.repeat(48)), 'x'.repeat(48));
+  assert.throws(() => validateSearch('x'.repeat(49)));
+  assert.equal(validateSearch('家'.repeat(16)), '家'.repeat(16));
+  assert.throws(() => validateSearch('家'.repeat(17)));
+  assert.equal(new TextEncoder().encode(buildSearchPattern('%'.repeat(24))).byteLength, D1_LIKE_PATTERN_MAX_BYTES);
+  assert.throws(() => validateSearch('%'.repeat(25)));
 });
 
 test('reaction allowlist rejects arbitrary emoji or text', () => {
@@ -95,6 +108,12 @@ test('API middleware allows only explicit message routes', () => {
   assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
 });
 
+test('deployment health route is read-only and explicit', () => {
+  assert.equal(routeAllowed('GET', ['health']), true);
+  assert.equal(routeAllowed('POST', ['health']), false);
+  assert.equal(routeAllowed('GET', ['health', 'details']), false);
+});
+
 test('API middleware exposes hardened auth session controls only by POST', () => {
   for (const action of ['login', 'logout', 'logout-all', 'logout-others', 'change-password']) {
     assert.equal(routeAllowed('POST', ['auth', action]), true);
@@ -130,4 +149,20 @@ test('password hash parser supports legacy upgrade and current 600k format', () 
 
 test('session cookie uses the host-only security prefix', () => {
   assert.equal(SESSION_COOKIE, '__Host-family_s_session');
+});
+
+test('pilot polling budget is substantially lower than the previous 2.5 second design', () => {
+  assert.equal(MESSAGE_POLL_MS, 10_000);
+  assert.equal(MEMBER_POLL_EVERY, 6);
+  const current = estimateIdleRequests({ users: 3, hours: 4 });
+  const previous = 3 * (2 + Math.floor((4 * 60 * 60 * 1000) / 2_500) * 2);
+  assert.equal(current, 5046);
+  assert.ok(current < previous / 6);
+});
+
+test('read markers are sent only when the newest message advances', () => {
+  assert.equal(shouldSendReadMarker(0, 100), true);
+  assert.equal(shouldSendReadMarker(100, 100), false);
+  assert.equal(shouldSendReadMarker(101, 100), false);
+  assert.equal(shouldSendReadMarker(100, 101), true);
 });

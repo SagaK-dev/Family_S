@@ -57,6 +57,8 @@ export async function onRequest(context) {
 }
 
 export function routeAllowed(method, parts) {
+  if (parts[0] === 'health' && parts.length === 1) return method === 'GET';
+
   if (parts[0] === 'auth' && parts.length === 2) {
     if (parts[1] === 'me') return method === 'GET';
     if (['bootstrap', 'register', 'login', 'logout', 'logout-all', 'logout-others', 'change-password'].includes(parts[1])) return method === 'POST';

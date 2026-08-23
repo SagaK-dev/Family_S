@@ -1,11 +1,12 @@
 {
   "name": "family-s-chat",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check": "node --check app.js && node --check sw.js && node --check shared/chat.js && node --check functions/api/_middleware.js && node --check functions/api/[[path]].js && node --check scripts/check-secrets.mjs && node -e \"JSON.parse(require('fs').readFileSync('manifest.webmanifest','utf8'))\"",
+    "check": "node --check app.js && node --check sw.js && node --check shared/chat.js && node --check shared/pilot.js && node --check functions/api/_middleware.js && node --check functions/api/[[path]].js && node --check scripts/check-secrets.mjs && node --check scripts/benchmark-password.mjs && node -e \"JSON.parse(require('fs').readFileSync('manifest.webmanifest','utf8'))\"",
+    "benchmark:password": "node scripts/benchmark-password.mjs",
     "security:check": "node scripts/check-secrets.mjs",
     "security:history": "node scripts/check-secrets.mjs --history"
   },

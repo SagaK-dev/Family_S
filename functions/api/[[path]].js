@@ -1,5 +1,6 @@
 import {
   buildReactionSummary,
+  buildSearchPattern,
   decodeCursor,
   encodeCursor,
   runTimelinePipeline,
@@ -32,6 +33,7 @@ export async function onRequest(context) {
 
     if (request.method !== 'GET') assertSameOrigin(request);
 
+    if (parts[0] === 'health' && request.method === 'GET') return handleHealth(env.FAMILY_DB);
     if (parts[0] === 'auth') return handleAuth(request, env, parts.slice(1));
 
     const user = await requireUser(request, env.FAMILY_DB);
@@ -48,6 +50,15 @@ export async function onRequest(context) {
     console.error('Family_S API error', error);
     return json({ error: 'Unexpected server error.' }, 500);
   }
+}
+
+async function handleHealth(db) {
+  const expectedTables = ['users', 'sessions', 'blocked_users', 'invites', 'messages', 'reactions', 'reads', 'auth_limits'];
+  const placeholders = expectedTables.map(() => '?').join(',');
+  const row = await db.prepare(`SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+    .bind(...expectedTables).first();
+  const ready = Number(row?.count || 0) === expectedTables.length;
+  return json({ ok: ready, schema: 'pilot-v1' }, ready ? 200 : 503);
 }
 
 async function handleAuth(request, env, parts) {
@@ -179,7 +190,7 @@ async function handleMessages(request, db, user, parts, url) {
     }
     if (query) {
       clauses.push("m.body LIKE ? ESCAPE '\\'");
-      bindings.push(`%${escapeLike(query)}%`);
+      bindings.push(buildSearchPattern(query));
     }
     if (pinnedOnly) clauses.push('m.pinned_at IS NOT NULL');
 
@@ -494,7 +505,7 @@ async function consumeAuthAttempt(db, bucket, limit) {
     RETURNING attempts, window_started_at`)
     .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
   if (Number(row?.attempts || 0) > limit) throw new HttpError(429, 'Too many login attempts. Try again later.');
-  if (Math.random() < 0.02) {
+  if (Number(row?.attempts || 0) === 1) {
     await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - 24 * 60 * 60 * 1000).run();
   }
 }
@@ -540,10 +551,6 @@ function cookieValue(request, name) {
     if (part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
   }
   return null;
-}
-
-function escapeLike(value) {
-  return value.replace(/[\\%_]/g, char => `\\${char}`);
 }
 
 async function sha256Text(value) {

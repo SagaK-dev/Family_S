@@ -1,46 +1,53 @@
 # Family S
 
-Family S is a private, family-only web chat designed for a small trusted group. It is implemented independently, with no X/Twitter branding or copied source code.
+Family S is a private, family-only web chat designed for a small trusted group. It runs on Cloudflare Pages Functions + D1 and has no runtime npm dependencies.
 
-The architecture takes inspiration from publicly documented ideas in X/Twitter's open-source recommendation/feed code: separate candidate retrieval from filtering/deduplication, keep timeline ordering explicit, preserve conversation context, and use cursor-based pagination. Those ideas are adapted here to a private chronological family chat rather than a public recommendation feed.
+The application uses a chronological timeline with replies, reactions, search, read markers, owner controls, and single-use invitations. It does not contain public profiles, recommendation feeds, ads, or analytics.
 
-References:
+## Important privacy boundary
 
-- `twitter/the-algorithm` — Home Mixer / Product Mixer public architecture
-- `xai-org/x-algorithm` — current public X feed/recommendation code
+Family S is **not end-to-end encrypted**. Message bodies are stored as plaintext in the configured Cloudflare D1 database so the server can perform search, reply-context, and timeline queries. Anyone with sufficient Cloudflare/D1 administrative access may be able to read those messages.
+
+Do not describe Family S to pilot participants as zero-knowledge or end-to-end encrypted.
 
 ## Features
 
-- Family-only authentication with username + password.
-- First-user bootstrap protected by a server-side `FAMILY_SETUP_SECRET`.
-- Exactly one owner enforced at the database level.
-- Owner-generated, single-use invite codes that expire after 24 hours.
-- PBKDF2-SHA256 password hashing with a random salt per user.
-- 30-day HttpOnly + Secure + SameSite=Strict session cookies.
-- Chronological family message timeline.
-- Reply-to-message context.
-- Emoji reactions with a server-side allowlist.
-- Edit your own messages.
-- Delete your own messages; the family owner may delete any message.
-- Owner-only message pinning.
-- Search across visible messages.
-- Read markers / aggregate seen count with server/database clamping.
-- Family member list.
-- Message send throttling and login-attempt throttling.
-- Explicit API route/method allowlisting and request validation.
-- Responsive phone/desktop interface.
-- Installable PWA shell.
-- Service worker explicitly excludes `/api/` from caching and uses network-first static updates.
-- No external analytics, ads, trackers, recommendation model, or public profile system.
+- username + password authentication
+- exactly one family owner, enforced by D1
+- first-owner bootstrap protected by `FAMILY_SETUP_SECRET`
+- owner-generated single-use invitations that expire after **1 hour**
+- active-invite listing and revocation
+- member account disable/re-enable with immediate session revocation
+- PBKDF2-HMAC-SHA256 password hashing
+- 600,000 iterations for current hashes; legacy 240,000-iteration hashes upgrade after successful login
+- 30-day random bearer sessions stored only as SHA-256 hashes
+- `__Host-family_s_session` cookie with `HttpOnly`, `Secure`, `SameSite=Strict`, and `Path=/`
+- logout current session, logout other devices, and logout all devices
+- password change with session rotation
+- chronological messages, replies, reactions, edit/delete, and owner pinning
+- bounded search compatible with Cloudflare D1's `LIKE` pattern limit
+- aggregate read/seen state with database clamping
+- PWA shell; `/api/` is never service-worker cached
+- public `/api/health` endpoint that checks whether required D1 tables are present
+
+## Pilot polling policy
+
+For a limited pilot, the visible-tab client uses conservative polling rather than the original 2.5-second loop:
+
+- message refresh: every **10 seconds**
+- member refresh: every **60 seconds**
+- read-marker write: only when the newest message timestamp advances
+- polling pauses while the tab is hidden and while search/pinned views are active
+
+The request-budget regression test models three users keeping the chat visible for four hours at about **5,046 idle refresh requests**, before user-generated actions. This is a planning model, not a production load test.
 
 ## Architecture
-
-The application is deliberately small and dependency-free at runtime:
 
 ```text
 Browser
   ├─ index.html / styles.css / app.js
-  ├─ polling timeline (2.5 s while visible)
+  ├─ 10 s visible-tab message polling
+  ├─ 60 s member polling
   └─ service worker for static shell only
           │
           ▼
@@ -52,6 +59,7 @@ Cloudflare Pages Functions
 Cloudflare D1
   ├─ users
   ├─ sessions
+  ├─ blocked_users
   ├─ invites
   ├─ messages
   ├─ reactions
@@ -59,141 +67,136 @@ Cloudflare D1
   └─ auth_limits
 ```
 
-`shared/chat.js` contains validation, cursor handling, reaction aggregation, and the timeline pipeline shared by the server and tests.
+`shared/chat.js` contains validation, D1-safe search-pattern construction, cursor handling, reaction aggregation, and timeline processing. `shared/pilot.js` contains the pilot polling constants and request-budget helpers.
 
-The timeline path follows a simple pipeline:
+## Security model
 
-1. fetch message candidates from D1;
-2. apply deletion/search/pin/cursor visibility constraints;
-3. normalize and deduplicate;
-4. order chronologically;
-5. attach reply/social context, reactions, and seen counts;
-6. return a bounded page plus an opaque cursor.
+### Passwords and sessions
 
-This is conceptually similar to the pipeline decomposition documented by X/Twitter, but the implementation here is original and much smaller.
+- current password hashes: PBKDF2-HMAC-SHA256, 600,000 iterations, random 16-byte salt, 256-bit output
+- legacy 240,000-iteration hashes remain readable and are upgraded after successful login
+- unknown-user login attempts perform a dummy PBKDF2 operation to reduce username-enumeration timing differences
+- login throttling uses atomic D1 counters for both IP-wide and IP+username buckets
+- session tokens contain 256 random bits and only their SHA-256 hashes are stored in D1
+- only v2 session tokens are accepted
+- users can revoke other sessions or every session
+- password changes revoke all old sessions and issue a fresh session
+- owner can disable a member; disabling immediately deletes that member's sessions
 
-## Security and privacy model
+### Browser and API controls
 
-This repository may be public. **Family message content and credentials are not stored in GitHub.** Runtime data lives in D1.
+- mutating requests reject cross-origin `Origin` and cross-site `Sec-Fetch-Site`
+- API routes and methods are explicitly allowlisted
+- request bodies are size-bounded
+- message/invite IDs are validated
+- search patterns are checked against D1's 50-byte `LIKE` pattern limit after SQL escaping and UTF-8 encoding
+- CSP, HSTS, frame denial, `nosniff`, referrer restrictions, COOP, and restrictive Permissions Policy are configured
+- API responses use `Cache-Control: no-store`
+- service worker excludes `/api/`
 
-Family S is **not end-to-end encrypted**. Message bodies are stored as plaintext in the configured D1 database so the server can perform search, reply context, and timeline queries. Anyone with sufficient Cloudflare/D1 administrative access may be able to read that data. Use a trusted Cloudflare account, enable strong account security, and do not treat Family S as a zero-knowledge messenger.
+See [SECURITY.md](SECURITY.md) for the security boundary and [PILOT_READINESS.md](PILOT_READINESS.md) for the pilot go/no-go checklist.
 
-### Secrets
+## Secrets
 
-Never commit real secrets. `.gitignore` excludes `.dev.vars`, `.env`, private keys, service-account files, and common credential files. CI also runs a repository secret scanner.
+Never commit real credentials. `.gitignore` excludes `.dev.vars`, `.env`, private keys, service-account files, and common credential files. CI scans both the current tree and Git history.
 
 Required production secret:
-
-- `FAMILY_SETUP_SECRET` — long random value used only to create the first owner account.
-
-Store it as a Cloudflare encrypted secret / environment secret. Do not place it in `app.js`, HTML, GitHub source, or a public build variable.
-
-`.dev.vars.example` only documents the variable name and contains no usable secret.
-
-### Authentication
-
-- Passwords: PBKDF2-SHA256, 240,000 iterations, random 16-byte salt, 256-bit derived output.
-- Sessions: random 256-bit bearer token; only its SHA-256 hash is stored in D1.
-- Session cookie: `HttpOnly; Secure; SameSite=Strict`.
-- Invite codes: random 192-bit value; only its SHA-256 hash is stored in D1.
-- Setup secret comparison is performed through fixed-size digests.
-- A partial unique index permits only one `owner` row, closing concurrent-bootstrap races.
-- Mutating browser requests reject cross-origin `Origin` values.
-- Login attempts are limited per hashed IP+username bucket.
-- Message send bursts are limited per user.
-- API middleware allows only explicit routes/methods and validates message IDs and payload types before the main handler.
-- Invalid client input is rejected as a 4xx response rather than leaking into generic server errors.
-- Read markers are validated against the current time and also clamped in D1 to an existing visible message timestamp.
-
-### Browser hardening
-
-`_headers` sets CSP, frame denial, referrer restrictions, nosniff, COOP, and disables unnecessary browser permissions.
-
-The service worker never caches `/api/` requests or responses. Static assets are network-first so an old cached JavaScript bundle does not indefinitely override a newer deployed client.
-
-## Review fixes applied before merge
-
-The pre-merge review found and fixed these issues:
-
-1. concurrent first-user requests could theoretically create multiple owners — fixed with a D1 unique owner constraint;
-2. a modified client could submit a future read timestamp — fixed with middleware validation plus database triggers that clamp reads to real message timestamps;
-3. catch-all message routes accepted ambiguous subpaths — fixed with an exact route/method allowlist and UUID validation;
-4. the first service-worker design was cache-first for static JavaScript and could retain stale client code — changed to network-first with stale-cache cleanup;
-5. oversized login passwords could reach expensive password derivation — bounded before the authentication handler;
-6. shared validators throw ordinary errors, which could otherwise become HTTP 500 — middleware now performs validation and converts bad requests into 4xx responses;
-7. pin requests could coerce string values such as `"false"` to true — middleware now requires a real boolean.
-
-## Cloudflare Pages deployment
-
-### 1. Create a D1 database
-
-Create a D1 database, then apply `schema.sql`.
-
-### 2. Bind D1
-
-Bind the D1 database to the Pages project with the binding name:
-
-```text
-FAMILY_DB
-```
-
-### 3. Configure the setup secret
-
-Create a long random secret in Cloudflare Pages settings:
 
 ```text
 FAMILY_SETUP_SECRET
 ```
 
-Do not commit the value.
+Use a long random value stored as a Cloudflare encrypted secret. Never put the real value in source, HTML, a public environment variable, or a GitHub issue.
 
-### 4. Deploy
+## Cloudflare deployment
 
-The project is static and does not require a build step.
+### New D1 database
 
-- Build command: leave empty (or run `npm run check`)
-- Static output: repository root (`.`)
+Create a D1 database and apply `schema.sql`.
 
-Cloudflare Pages deploys the `functions/` directory automatically.
+### Existing D1 database
 
-### 5. Initialize the family
+Apply:
 
-Open the deployed site, select **初回設定**, and enter the same `FAMILY_SETUP_SECRET` once to create the owner account. The database also enforces that only one owner may exist.
+```text
+migrations/0002_security_hardening.sql
+```
 
-The owner can then create one-time invitation codes from the app.
+Re-running the idempotent `schema.sql` is also supported for the current schema additions.
 
-## Local development
+### Bindings
 
-Node.js 22+ is used for checks/tests only.
+Bind D1 to the Pages project as:
+
+```text
+FAMILY_DB
+```
+
+Set `FAMILY_SETUP_SECRET` as an encrypted Cloudflare secret.
+
+### Health check
+
+After deployment, request:
+
+```text
+GET /api/health
+```
+
+A ready deployment returns HTTP 200 with:
+
+```json
+{"ok":true,"schema":"pilot-v1"}
+```
+
+If the D1 binding exists but required tables are missing, the endpoint returns HTTP 503. It intentionally exposes no row counts, usernames, messages, or other family data.
+
+## Verification
+
+Node.js 22+ is used for repository checks.
 
 ```bash
 npm test
 npm run check
+npm run benchmark:password
 npm run security:check
+npm run security:history
 ```
 
-For Cloudflare-local development, copy `.dev.vars.example` to `.dev.vars` and replace the placeholder locally. Never commit `.dev.vars`.
+The password benchmark confirms that the 600k PBKDF2 path actually runs in CI; its elapsed wall-clock time is **not** a substitute for Cloudflare Workers CPU measurements.
 
-## Tests
+Current automated coverage includes:
 
-The current suite has 11 unit tests covering:
+- username/display-name/password/message validation
+- D1-safe ASCII, Japanese, and escaped-wildcard search bounds
+- reaction allowlisting
+- cursor round-trip/rejection
+- timeline ordering/deduplication/page bounds
+- route/method allowlisting, including the read-only health endpoint
+- owner/member control routes
+- legacy/current password-hash parsing
+- host-only session cookie name
+- pilot request-budget regression
+- read-marker write deduplication
+- current-tree and full-Git-history secret scanning
 
-- username normalization/validation;
-- display-name and password bounds;
-- message/search input bounds;
-- reaction allowlisting;
-- opaque cursor round-trip/rejection;
-- timeline deduplication and chronological ordering;
-- page-size clamping;
-- reaction summary/current-user state;
-- strict message route allowlisting;
-- rejection of wrong authentication methods and unknown routes.
+## Pilot readiness
 
-CI additionally performs JavaScript syntax checks, manifest parsing, and secret scanning.
+A green GitHub Actions run verifies the source, but it does **not** prove the target Cloudflare account is ready.
 
-## Important deployment limitation
+Before inviting external households, complete `PILOT_READINESS.md`, including:
 
-Repository review and GitHub Actions validate the implementation, but a live Cloudflare D1 deployment has not been exercised from multiple real family devices in the target account. Live authentication, D1 schema application, mobile PWA install, and multi-device polling should be verified after deployment.
+- actual Pages + D1 deployment and `/api/health`
+- production-like login/register/password-change measurements
+- check for Workers CPU-limit errors in Pages Functions logs
+- owner/member tests on at least two devices or browsers
+- invite reuse/revocation tests
+- session revocation and member-disable tests
+- D1 Time Travel restore drill on a disposable staging/pilot database
+- Cloudflare MFA and least-privilege access
+- GitHub push protection/secret scanning where available
+- protected `main` with required CI checks
+
+Because current password hashing uses 600,000 PBKDF2 iterations, do not assume the Workers Free 10 ms CPU allowance is sufficient. Use a suitable Cloudflare plan for the pilot unless measurements in the actual deployment demonstrate reliable operation.
 
 ## Project structure
 
@@ -207,13 +210,19 @@ Family_S/
 ├─ sw.js
 ├─ _headers
 ├─ schema.sql
+├─ SECURITY.md
+├─ PILOT_READINESS.md
+├─ migrations/
+│  └─ 0002_security_hardening.sql
 ├─ shared/
-│  └─ chat.js
+│  ├─ chat.js
+│  └─ pilot.js
 ├─ functions/
 │  └─ api/
 │     ├─ _middleware.js
 │     └─ [[path]].js
 ├─ scripts/
+│  ├─ benchmark-password.mjs
 │  └─ check-secrets.mjs
 ├─ tests/
 │  └─ chat.test.js
@@ -222,4 +231,4 @@ Family_S/
 
 ## Scope
 
-Family S is not a clone of X/Twitter. The public X/Twitter repositories are used only as architectural study material for pipeline decomposition, feed ordering, filtering, conversation context, and pagination. No proprietary systems, private data, UI assets, brand elements, or source text are copied into this project.
+Family S is not a clone of X/Twitter. Public X/Twitter architecture was used only as study material for pipeline decomposition, feed ordering, filtering, conversation context, and pagination. No proprietary systems, private data, UI assets, brand elements, or source text are copied.
