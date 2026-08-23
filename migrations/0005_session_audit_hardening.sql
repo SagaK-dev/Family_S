@@ -1,5 +1,11 @@
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS invite_claims (
+  code_hash TEXT PRIMARY KEY REFERENCES invites(code_hash) ON DELETE CASCADE,
+  claim_token TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at DESC, token_hash DESC);
 CREATE INDEX IF NOT EXISTS idx_invites_created_by ON invites(created_by);
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
