@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS auth_limits (
   attempts INTEGER NOT NULL,
   window_started_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_auth_limits_window_started_at ON auth_limits(window_started_at);
 
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY,
@@ -99,3 +100,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_user_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_events_type_insert
+BEFORE INSERT ON audit_events
+WHEN NEW.event_type NOT IN (
+  'password_changed',
+  'account_deleted',
+  'member_deleted',
+  'sessions_revoked_all',
+  'member_disabled',
+  'member_enabled',
+  'invite_created',
+  'invite_revoked',
+  'message_deleted',
+  'message_pin_changed'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid audit event type');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_events_type_update
+BEFORE UPDATE OF event_type ON audit_events
+WHEN NEW.event_type != OLD.event_type
+BEGIN
+  SELECT RAISE(ABORT, 'audit event type is immutable');
+END;
