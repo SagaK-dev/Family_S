@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   buildReactionSummary,
   buildSearchPattern,
@@ -21,7 +22,7 @@ import {
   estimateIdleRequests,
   shouldSendReadMarker,
 } from '../shared/pilot.js';
-import { routeAllowed } from '../functions/api/_middleware.js';
+import { onRequest as middlewareOnRequest, routeAllowed } from '../functions/api/_middleware.js';
 import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from '../functions/api/[[path]].js';
 
 test('normalizes and validates usernames', () => {
@@ -108,14 +109,52 @@ test('API middleware allows only explicit message routes', () => {
   assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
 });
 
-test('deployment health route is read-only and explicit', () => {
+test('API middleware rejects JSON bodies above 16 KiB before downstream execution', async () => {
+  let downstreamCalled = false;
+  const oversized = new Request('https://family.example/api/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'x'.repeat(17_000) }),
+  });
+  const rejected = await middlewareOnRequest({
+    request: oversized,
+    env: {},
+    next: async () => {
+      downstreamCalled = true;
+      return new Response('{}', { status: 200 });
+    },
+  });
+  assert.equal(rejected.status, 413);
+  assert.equal(downstreamCalled, false);
+
+  const accepted = new Request('https://family.example/api/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'hello family' }),
+  });
+  const passed = await middlewareOnRequest({
+    request: accepted,
+    env: {},
+    next: async () => {
+      downstreamCalled = true;
+      return new Response('{}', { status: 200 });
+    },
+  });
+  assert.equal(passed.status, 200);
+  assert.equal(downstreamCalled, true);
+});
+
+test('deployment health and audit routes are read-only and explicit', () => {
   assert.equal(routeAllowed('GET', ['health']), true);
   assert.equal(routeAllowed('POST', ['health']), false);
   assert.equal(routeAllowed('GET', ['health', 'details']), false);
+  assert.equal(routeAllowed('GET', ['audit']), true);
+  assert.equal(routeAllowed('POST', ['audit']), false);
+  assert.equal(routeAllowed('GET', ['audit', 'details']), false);
 });
 
-test('API middleware exposes hardened auth session controls only by POST', () => {
-  for (const action of ['login', 'logout', 'logout-all', 'logout-others', 'change-password']) {
+test('API middleware exposes hardened auth session and withdrawal controls only by POST', () => {
+  for (const action of ['login', 'logout', 'logout-all', 'logout-others', 'change-password', 'delete-account']) {
     assert.equal(routeAllowed('POST', ['auth', action]), true);
     assert.equal(routeAllowed('GET', ['auth', action]), false);
   }
@@ -123,12 +162,14 @@ test('API middleware exposes hardened auth session controls only by POST', () =>
   assert.equal(routeAllowed('POST', ['admin']), false);
 });
 
-test('API middleware restricts member disable and invitation revocation routes', () => {
+test('API middleware restricts member lifecycle and invitation routes', () => {
   const memberId = '123e4567-e89b-42d3-a456-426614174000';
   const inviteId = 'A'.repeat(43);
   assert.equal(routeAllowed('GET', ['members']), true);
   assert.equal(routeAllowed('POST', ['members', memberId, 'disable']), true);
   assert.equal(routeAllowed('DELETE', ['members', memberId, 'disable']), true);
+  assert.equal(routeAllowed('POST', ['members', memberId, 'delete']), true);
+  assert.equal(routeAllowed('DELETE', ['members', memberId, 'delete']), false);
   assert.equal(routeAllowed('POST', ['members', memberId, 'other']), false);
   assert.equal(routeAllowed('GET', ['invites']), true);
   assert.equal(routeAllowed('POST', ['invites']), true);
@@ -165,4 +206,14 @@ test('read markers are sent only when the newest message advances', () => {
   assert.equal(shouldSendReadMarker(100, 100), false);
   assert.equal(shouldSendReadMarker(101, 100), false);
   assert.equal(shouldSendReadMarker(100, 101), true);
+});
+
+test('schema and migration include privacy-safe audit storage', () => {
+  const schema = fs.readFileSync(new URL('../schema.sql', import.meta.url), 'utf8');
+  const migration = fs.readFileSync(new URL('../migrations/0003_pilot_audit.sql', import.meta.url), 'utf8');
+  for (const sql of [schema, migration]) {
+    assert.match(sql, /CREATE TABLE IF NOT EXISTS audit_events/);
+    assert.match(sql, /actor_user_id TEXT REFERENCES users\(id\) ON DELETE SET NULL/);
+    assert.match(sql, /subject_user_id TEXT REFERENCES users\(id\) ON DELETE SET NULL/);
+  }
 });

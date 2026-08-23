@@ -6,10 +6,15 @@ import {
   validateSearch,
   validateUsername,
 } from '../../shared/chat.js';
+import { recordAudit, requirePilotUser } from './_security.js';
 
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_STALE_MS = 24 * 60 * 60 * 1000;
+const JSON_LIMIT = 16 * 1024;
+export const MESSAGE_WRITE_LIMIT = 12;
+export const MESSAGE_WRITE_WINDOW_MS = 10_000;
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -17,7 +22,7 @@ export async function onRequest(context) {
   const parts = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
   const method = request.method.toUpperCase();
 
-  if (method === 'OPTIONS') return context.next();
+  if (method === 'OPTIONS') return secureApiResponse(await context.next());
   if (!routeAllowed(method, parts)) return apiError(404, 'Not found.');
 
   if (method !== 'GET') {
@@ -42,26 +47,52 @@ export async function onRequest(context) {
 
     if (method !== 'GET' && expectsJson(method, parts)) {
       const type = request.headers.get('Content-Type') || '';
-      if (type.toLowerCase().startsWith('application/json')) {
-        const body = await request.clone().json();
-        validatePayload(method, parts, body);
-      }
+      if (!type.toLowerCase().startsWith('application/json')) return apiError(415, 'Content-Type must be application/json.');
+      const body = await readLimitedJson(request.clone());
+      validatePayload(method, parts, body);
+    }
+
+    if (method === 'POST' && parts.length === 1 && parts[0] === 'messages' && env?.FAMILY_DB) {
+      const user = await requirePilotUser(request, env.FAMILY_DB);
+      await consumeMessageAttempt(env.FAMILY_DB, user.id);
     }
   } catch (error) {
     if (error?.rateLimited) return apiError(429, 'Too many setup attempts. Try again later.');
+    if (error?.messageRateLimited) return apiError(429, 'You are sending messages too quickly.');
+    if (error?.status === 413) return apiError(413, 'Request is too large.');
+    if ([401, 403, 429].includes(error?.status)) return apiError(error.status, error.message || 'Request rejected.');
     if (parts[0] === 'auth' && parts[1] === 'login') return apiError(401, 'Invalid username or password.');
     return apiError(400, error instanceof Error ? error.message : 'Invalid request.');
   }
 
-  return context.next();
+  const response = await context.next();
+  if (response.ok && env?.FAMILY_DB) {
+    const descriptor = auditDescriptor(method, parts);
+    if (descriptor) {
+      try {
+        const actor = await requirePilotUser(request, env.FAMILY_DB);
+        await recordAudit(env.FAMILY_DB, descriptor.eventType, actor.id, descriptor.subjectUserId);
+      } catch (error) {
+        console.warn(JSON.stringify({
+          event: 'audit_write_failed',
+          method,
+          path: url.pathname,
+          cfRay: request.headers.get('CF-Ray') || null,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        }));
+      }
+    }
+  }
+  return secureApiResponse(response);
 }
 
 export function routeAllowed(method, parts) {
   if (parts[0] === 'health' && parts.length === 1) return method === 'GET';
+  if (parts[0] === 'audit' && parts.length === 1) return method === 'GET';
 
   if (parts[0] === 'auth' && parts.length === 2) {
     if (parts[1] === 'me') return method === 'GET';
-    if (['bootstrap', 'register', 'login', 'logout', 'logout-all', 'logout-others', 'change-password'].includes(parts[1])) return method === 'POST';
+    if (['bootstrap', 'register', 'login', 'logout', 'logout-all', 'logout-others', 'change-password', 'delete-account'].includes(parts[1])) return method === 'POST';
     return false;
   }
 
@@ -75,6 +106,7 @@ export function routeAllowed(method, parts) {
   if (parts[0] === 'members') {
     if (parts.length === 1) return method === 'GET';
     if (parts.length === 3 && MESSAGE_ID_RE.test(parts[1]) && parts[2] === 'disable') return method === 'POST' || method === 'DELETE';
+    if (parts.length === 3 && MESSAGE_ID_RE.test(parts[1]) && parts[2] === 'delete') return method === 'POST';
     return false;
   }
 
@@ -107,6 +139,12 @@ function validatePayload(method, parts, body) {
       if (current === String(body.newPassword ?? '')) throw new Error('New password must be different.');
       return;
     }
+    if (parts[1] === 'delete-account') {
+      const current = String(body.currentPassword ?? '');
+      if (current.length < 1 || current.length > 128) throw new Error('Invalid current password.');
+      if (String(body.confirmation ?? '') !== 'DELETE') throw new Error('Account deletion confirmation is invalid.');
+      return;
+    }
     validateUsername(body.username);
     if (parts[1] === 'login') {
       const password = String(body.password ?? '');
@@ -119,6 +157,13 @@ function validatePayload(method, parts, body) {
       const code = String(body.inviteCode ?? '').trim();
       if (code.length < 16 || code.length > 128) throw new Error('Invalid invite code.');
     }
+    return;
+  }
+
+  if (parts[0] === 'members' && parts[2] === 'delete') {
+    const current = String(body.currentPassword ?? '');
+    if (current.length < 1 || current.length > 128) throw new Error('Invalid current password.');
+    if (String(body.confirmation ?? '') !== 'DELETE') throw new Error('Member deletion confirmation is invalid.');
     return;
   }
 
@@ -150,6 +195,55 @@ function validatePayload(method, parts, body) {
   }
 }
 
+function auditDescriptor(method, parts) {
+  if (parts[0] === 'members' && parts[2] === 'disable') {
+    return { eventType: method === 'POST' ? 'member_disabled' : 'member_enabled', subjectUserId: parts[1] };
+  }
+  if (parts[0] === 'invites' && parts.length === 1 && method === 'POST') return { eventType: 'invite_created', subjectUserId: null };
+  if (parts[0] === 'invites' && parts.length === 2 && method === 'DELETE') return { eventType: 'invite_revoked', subjectUserId: null };
+  if (parts[0] === 'messages' && parts.length === 2 && method === 'DELETE') return { eventType: 'message_deleted', subjectUserId: null };
+  if (parts[0] === 'messages' && parts.length === 3 && parts[2] === 'pin' && method === 'POST') return { eventType: 'message_pin_changed', subjectUserId: null };
+  return null;
+}
+
+async function readLimitedJson(request) {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (declared > JSON_LIMIT) {
+    const error = new Error('Request is too large.');
+    error.status = 413;
+    throw error;
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) return {};
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > JSON_LIMIT) {
+      void reader.cancel().catch(() => {});
+      const error = new Error('Request is too large.');
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes) || '{}');
+  } catch {
+    throw new Error('Invalid JSON.');
+  }
+}
+
 async function consumeBootstrapAttempt(db, bucket) {
   const now = Date.now();
   const row = await db.prepare(`
@@ -159,10 +253,35 @@ async function consumeBootstrapAttempt(db, bucket) {
       window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
     RETURNING attempts`)
     .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
-  if (Number(row?.attempts || 0) > 10) {
+  const attempts = Number(row?.attempts || 0);
+  if (attempts > 10) {
     const error = new Error('Rate limited');
     error.rateLimited = true;
     throw error;
+  }
+  if (attempts === 1) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - RATE_LIMIT_STALE_MS).run();
+  }
+}
+
+async function consumeMessageAttempt(db, userId) {
+  const now = Date.now();
+  const bucket = await sha256Hex(`message\n${userId}`);
+  const row = await db.prepare(`
+    INSERT INTO auth_limits (bucket_hash, attempts, window_started_at) VALUES (?, 1, ?)
+    ON CONFLICT(bucket_hash) DO UPDATE SET
+      attempts = CASE WHEN auth_limits.window_started_at + ? <= ? THEN 1 ELSE auth_limits.attempts + 1 END,
+      window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
+    RETURNING attempts`)
+    .bind(bucket, now, MESSAGE_WRITE_WINDOW_MS, now, MESSAGE_WRITE_WINDOW_MS, now, now).first();
+  const attempts = Number(row?.attempts || 0);
+  if (attempts > MESSAGE_WRITE_LIMIT) {
+    const error = new Error('Message rate limited');
+    error.messageRateLimited = true;
+    throw error;
+  }
+  if (attempts === 1) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - RATE_LIMIT_STALE_MS).run();
   }
 }
 
@@ -171,16 +290,22 @@ async function sha256Hex(value) {
   return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+export function secureApiResponse(originalResponse) {
+  const response = new Response(originalResponse.body, originalResponse);
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('Content-Security-Policy', "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  response.headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  response.headers.set('Referrer-Policy', 'no-referrer');
+  response.headers.set('Strict-Transport-Security', 'max-age=31536000');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+  response.headers.set('X-Frame-Options', 'DENY');
+  response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  return response;
+}
+
 function apiError(status, message) {
-  return new Response(JSON.stringify({ error: message }), {
+  return secureApiResponse(new Response(JSON.stringify({ error: message }), {
     status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
-      'Referrer-Policy': 'no-referrer',
-      'Strict-Transport-Security': 'max-age=31536000',
-      'X-Content-Type-Options': 'nosniff',
-    },
-  });
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  }));
 }
