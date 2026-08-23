@@ -1,10 +1,10 @@
 # Pilot Readiness
 
-This checklist is the release gate for a limited Family S pilot. A source-code CI pass is necessary but does not replace validation in the actual Cloudflare account.
+This checklist is the release gate for a limited Family S pilot. Source-code CI is necessary but does not replace validation in the actual Cloudflare account.
 
-## Current source-level gates
+## Source-level gates
 
-The repository must pass all of the following before a pilot deployment:
+The repository must pass:
 
 - `npm test`
 - `npm run check`
@@ -12,144 +12,143 @@ The repository must pass all of the following before a pilot deployment:
 - `npm run security:check`
 - `npm run security:history`
 
-The client polling policy is intentionally conservative for a small pilot:
+Current source-level controls include:
 
-- message refresh: every 10 seconds while the tab is visible
-- member refresh: every 60 seconds
-- read-marker writes: only when the newest message timestamp advances
-- polling stops while the tab is hidden or while search/pinned views are active
-
-The message search validator enforces Cloudflare D1's 50-byte maximum `LIKE` pattern after SQL wildcard escaping and UTF-8 encoding.
-
-Message creation also has an atomic D1 write limiter: at most 12 accepted attempts per authenticated user in a 10-second window. The limiter is implemented with `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING`, so concurrent requests cannot all pass a separate count-then-write check.
-
-Pilot security/admin changes are written to `audit_events`. Audit rows intentionally contain only event type, actor/subject references, and timestamp. They never contain passwords, message bodies, invitation codes, or request bodies. If a participant is deleted, foreign-key `ON DELETE SET NULL` removes their user reference from historical audit rows. Audit event types are allowlisted in code and enforced again by D1 triggers.
+- message refresh every 10 seconds while visible
+- member refresh every 60 seconds
+- read-marker writes only when the newest message advances
+- D1-safe 50-byte `LIKE` search bound after escaping/UTF-8 encoding
+- atomic message limiter: 12 attempts/user/10 seconds
+- maximum 8 active sessions/user after session issuance
+- exact Pages Function routes for all core authentication endpoints
+- concurrency-safe invitation registration using unique `invite_claims` inside a D1 batch
+- metadata-only, append-only audit events with participant-reference anonymization allowed
 
 ## Required Cloudflare deployment gates
 
-Do not invite external pilot households until every item below has been checked in the production-like Cloudflare environment.
+Do not invite external pilot households until every item is checked in a production-like environment.
 
-1. For a new D1 database, apply the current `schema.sql`. For an existing database, apply `migrations/0002_security_hardening.sql`, `migrations/0003_pilot_audit.sql`, and `migrations/0004_runtime_hardening.sql` if they have not already been applied.
+1. New D1: apply current `schema.sql`. Existing D1: apply every missing migration in order through `migrations/0005_session_audit_hardening.sql`.
 2. Configure the D1 binding as `FAMILY_DB`.
 3. Configure a long random `FAMILY_SETUP_SECRET` as an encrypted Cloudflare secret.
-4. Enable MFA on the Cloudflare account and restrict administrative access to the minimum necessary people.
-5. Confirm HTTPS-only access and that the application is served from the intended hostname.
-6. Confirm `GET /api/health` returns HTTP 200 and `{"ok":true,"schema":"pilot-v3"}`. HTTP 503 means the D1 binding, a required table, or a required integrity trigger is missing.
-7. Confirm the static document response includes `Content-Security-Policy` with `base-uri 'none'` and `form-action 'none'`, `Cross-Origin-Resource-Policy: same-origin`, and `X-Robots-Tag: noindex, nofollow, noarchive`.
-8. Confirm API responses include `Cache-Control: no-store`, frame denial, `nosniff`, HSTS, no-referrer, same-origin resource policy, and no-index headers. Pages `_headers` does not apply to Functions responses, so verify the actual API response.
-9. Enable Workers/Pages observability and logs before the pilot. For a small pilot, start with 100% head sampling so authentication/CPU/D1 faults are diagnosable, then reduce sampling only if traffic warrants it.
-10. Tail Pages Functions logs during the smoke test and confirm there are no 1102 CPU-limit errors, uncaught exceptions, repeated `audit_write_failed` warnings, or D1 overloaded errors.
-11. Profile login, registration, password change, self-deletion, and owner-confirmed member deletion with production-like data. The application intentionally keeps PBKDF2-HMAC-SHA256 at 600,000 iterations. Workers Free has a 10 ms CPU limit per HTTP request, so use Workers Paid for the pilot unless measurements in the actual environment demonstrate that the current authentication path is reliable.
-12. Confirm the daily request count stays comfortably below the applicable plan limit. The source-level budget test models 3 users active for 4 hours at about 5,046 idle-refresh requests, before user-generated actions.
-13. Enable GitHub secret scanning/push protection where available and protect `main` with required CI checks. The repository code cannot enable these account/repository settings by itself.
+4. Enable MFA and restrict Cloudflare administrative access to the minimum necessary people.
+5. Confirm HTTPS-only access on the intended hostname.
+6. Confirm `GET /api/health` returns HTTP 200 and `{"ok":true,"schema":"pilot-v4"}`. HTTP 503 means a required binding/table/trigger/index is missing.
+7. Confirm static responses include restrictive CSP (`base-uri 'none'`, `form-action 'none'`), same-origin resource policy, and no-index headers.
+8. Confirm API responses include `Cache-Control: no-store`, restrictive CSP, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, restrictive Permissions Policy, HSTS, frame denial, `nosniff`, no-referrer, and no-index headers.
+9. Enable Pages/Workers observability before the pilot. Start with sufficiently high sampling for a small pilot so authentication/CPU/D1 faults can be diagnosed.
+10. During smoke testing, confirm there are no Workers CPU-limit errors, uncaught exceptions, repeated `audit_write_failed` warnings, or D1 overload errors.
+11. Profile login, registration, password change, self-deletion, and owner-confirmed deletion with production-like data. PBKDF2 remains 600,000 iterations; do not assume the Workers Free CPU allowance is sufficient.
+12. Confirm daily request volume remains comfortably below the applicable plan limit. The source model estimates about 5,046 idle refresh requests for 3 users over 4 visible hours.
+13. Enable GitHub secret scanning/push protection where available and protect `main` with required CI checks.
 
 Cloudflare references:
 
 - Workers limits: https://developers.cloudflare.com/workers/platform/limits/
-- Workers best practices / observability: https://developers.cloudflare.com/workers/best-practices/workers-best-practices/
+- Workers best practices: https://developers.cloudflare.com/workers/best-practices/workers-best-practices/
 - Workers logs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
 - D1 limits: https://developers.cloudflare.com/d1/platform/limits/
 - Pages Functions routing: https://developers.cloudflare.com/pages/functions/routing/
 - Pages headers: https://developers.cloudflare.com/pages/configuration/headers/
-- Pages Functions logging: https://developers.cloudflare.com/pages/functions/debugging-and-logging/
-- D1 binding and `batch()`: https://developers.cloudflare.com/d1/worker-api/d1-database/
+- D1 database / `batch()`: https://developers.cloudflare.com/d1/worker-api/d1-database/
 - D1 Time Travel: https://developers.cloudflare.com/d1/reference/time-travel/
 
 ## Multi-device smoke test
 
-Use at least two separate devices/browsers and test both the owner and a member account.
+Use at least two separate devices/browsers and both owner/member accounts.
 
 - bootstrap the first owner exactly once
 - create an invite and register a member
 - reject invite reuse
-- send plain text and Japanese text
-- send a 2,000-character message and reject 2,001 characters
-- reply to a message
-- add/remove every allowed reaction
-- edit only your own message
-- verify member cannot pin messages
-- verify owner can pin/unpin and delete a member message
-- verify read counts advance across two devices
-- search ASCII, Japanese, `%`, `_`, and `\\` values near the D1 byte limit
-- verify an over-limit search is rejected cleanly rather than causing a D1 error
-- issue more than 12 message POSTs inside one 10-second window and confirm excess requests receive HTTP 429
-- repeat that message burst concurrently and confirm parallel requests cannot bypass the limiter
-- wait for the 10-second window to reset and confirm normal message sending resumes
-- revoke an unused invite and verify it can no longer register
-- disable a member and verify all of that member's sessions stop working
-- re-enable the member and verify a fresh login is required
-- use “logout other devices” and verify the current device remains signed in
-- use “logout all devices” and verify every session is rejected and an audit row exists
-- change the password and verify old sessions and the old password no longer work
-- verify repeated wrong-password attempts against password-change/delete operations eventually return HTTP 429
-- verify the owner can view `/api/audit` but a normal member receives HTTP 403
-- verify audit output never includes message bodies, passwords, invitation codes, cookies, or request bodies
-- leave the chat visible for at least 30 minutes and confirm polling remains stable without request spikes
+- attempt two registrations against the same invite concurrently; exactly one must succeed
+- trigger a username conflict during registration and verify the invite is not consumed by the failed transaction
+- login repeatedly from more than 8 browser contexts and verify older sessions are pruned so at most 8 remain active
+- send plain text, Japanese text, and a 2,000-character message; reject 2,001 characters
+- reply, react/unreact, edit only own messages
+- verify member cannot pin and owner can pin/unpin
+- verify read counts across devices
+- test ASCII/Japanese/`%`/`_`/`\\` searches near the D1 limit and reject over-limit search cleanly
+- issue >12 message POSTs in one 10-second window and confirm excess requests return 429
+- repeat the burst concurrently and confirm parallel requests cannot bypass the limiter
+- revoke an unused invite and verify registration fails
+- disable a member and verify every session stops working
+- re-enable the member and require a fresh login
+- verify logout-other-devices preserves current session
+- verify logout-all revokes every session and creates an audit event
+- change the password and verify old sessions/password fail
+- verify repeated wrong current-password attempts eventually return 429
+- verify owner can view `/api/audit` and member receives 403
+- verify audit output contains no messages/passwords/invite codes/cookies/request bodies
+- keep the chat visible for at least 30 minutes and confirm stable polling without spikes
 
 ## Database integrity smoke test
 
-Run these checks on a disposable staging/pilot D1 database, not on a production family space with real data.
+Run on disposable staging/pilot D1 only.
 
-- confirm `idx_auth_limits_window_started_at` exists
-- confirm `trg_audit_events_type_insert` and `trg_audit_events_type_update` exist
-- attempt to insert an audit event with an unknown `event_type` and confirm D1 rejects it
-- insert a valid disposable audit row, attempt to change its `event_type`, and confirm D1 rejects the update
-- confirm deleting a disposable participant can still null actor/subject references in surviving audit rows; the event-type immutability trigger must not block foreign-key `ON DELETE SET NULL`
-- confirm read-clamp triggers still exist and function after migration 0004
+Confirm the following objects exist after migration 0005:
 
-`GET /api/health` should remain HTTP 200 / `pilot-v3` after these checks.
+- table `invite_claims`
+- index `idx_sessions_user_created`
+- index `idx_invites_created_by`
+- index `idx_messages_user`
+- index `idx_messages_pinned_by`
+- index `idx_reactions_user`
+- index `idx_audit_events_subject`
+- triggers `trg_audit_events_type_insert`, `trg_audit_events_type_update`
+- triggers `trg_audit_events_guard_update`, `trg_audit_events_guard_delete`
+- read-clamp triggers
+
+Then verify:
+
+- unknown audit event type insertion is rejected
+- changing audit event id/type/timestamp is rejected
+- changing actor/subject to a different non-null user is rejected
+- deleting an audit row is rejected
+- deleting a disposable participant can still change their surviving audit references from user id to `NULL`
+- concurrent invitation claims cannot both succeed
+- a failed member insert rolls back invitation consumption
+- `/api/health` remains HTTP 200 / `pilot-v4`
 
 ## Participant withdrawal and data deletion
 
-Participants can withdraw from the application UI. A member must re-enter the current password and type `DELETE`; `POST /api/auth/delete-account` then deletes the member row. The database cascade removes that member's sessions, authored messages, reactions, read marker, blocked-member record, and invitations they created. Reply links from surviving messages become empty where the referenced message was removed.
+A member withdraws by re-entering the current password and typing `DELETE`. The owner can perform an owner-confirmed member deletion when self-service is unavailable.
 
-The sole owner cannot self-delete through this endpoint. This prevents the pilot family space from being left without an administrator.
+After deletion confirm:
 
-When a participant cannot perform self-service deletion, the owner can use the member deletion control. Owner deletion requires the owner's current password plus the explicit `DELETE` confirmation and is limited to member accounts. The operation is rate-limited and audit-recorded.
+- the account cannot authenticate
+- all sessions are gone
+- authored messages/reactions/read marker are gone
+- dependent invites and temporary invite claims are gone
+- the remaining timeline renders correctly
+- unrelated users are unaffected
+- surviving audit event metadata remains but the deleted user's actor/subject references are `NULL` where applicable
 
-After any withdrawal/deletion, confirm:
-
-- the deleted member cannot authenticate
-- their sessions are absent
-- their authored messages and reactions are absent
-- the remaining family timeline still renders correctly
-- no unrelated family member was affected
-- the audit event remains but the deleted participant reference has been nulled where required
-
-Do not promise immediate deletion from Cloudflare's underlying disaster-recovery history. D1 Time Travel may retain a restorable historical database state for the plan's retention window. Pilot consent/privacy text should disclose the operational retention policy accurately.
+Do not promise immediate deletion from D1 disaster-recovery history. Time Travel may retain a restorable historical state for the plan's retention window.
 
 ## Recovery drill
 
-Perform the recovery drill on a disposable pilot/staging D1 database before storing external participant data.
+Perform on disposable staging D1 before external participant data is stored.
 
-1. Get the current bookmark:
-
-   `npx wrangler d1 time-travel info YOUR_DATABASE`
-
-2. Record a known test message and the current time.
-3. Delete or modify that test data intentionally.
-4. Restore the database to the recorded pre-change bookmark or timestamp:
-
-   `npx wrangler d1 time-travel restore YOUR_DATABASE --bookmark=YOUR_BOOKMARK`
-
-5. Confirm the test data is restored and that login, timeline, reactions, read markers, invites, blocked-member state, `audit_events`, the audit integrity triggers, and the auth-limit cleanup index still behave correctly.
-6. Record the restore result and the `previous_bookmark` so the restore itself can be undone if required.
-
-Time Travel is always enabled for supported D1 production databases. Free-plan history is shorter than Paid-plan history, so confirm the current plan limits before the pilot.
+1. Record a Time Travel bookmark.
+2. Add known disposable test data.
+3. Intentionally delete/modify it.
+4. Restore to the pre-change bookmark/timestamp.
+5. Confirm login, sessions, timeline, reactions, reads, invites, `invite_claims`, blocked-member state, audit events/triggers, and required indexes behave correctly after restore.
+6. Record the restore result and previous bookmark so the restore can be reversed if necessary.
 
 ## Incident stop procedure
 
-If a security or data-integrity incident occurs during the pilot:
+If a security/data-integrity incident occurs:
 
-1. stop issuing invitations and revoke all active invites
+1. stop issuing invitations and revoke active invites
 2. disable affected member accounts
-3. rotate `FAMILY_SETUP_SECRET` if its confidentiality is in doubt
-4. revoke affected sessions using logout-all or by disabling the member
-5. inspect the privacy-safe audit log and Pages Functions logs without copying message bodies or credentials into tickets
-6. check `GET /api/health`; a transition from `pilot-v3`/200 to 503 is a deployment-integrity failure and should stop the pilot
+3. rotate `FAMILY_SETUP_SECRET` if confidentiality is in doubt
+4. revoke affected sessions
+5. inspect metadata-only audit events and Pages Functions logs without copying private message content or credentials into tickets
+6. check `/api/health`; anything other than HTTP 200 / `pilot-v4` is a deployment-integrity stop condition
 7. use D1 Time Travel if data integrity was damaged
-8. pause the pilot until the cause is understood and a regression test has been added
+8. pause the pilot until the cause is understood and a regression test is added
 
-## Pilot go/no-go rule
+## Go / no-go
 
-A family-internal alpha can run after CI passes. External households should only be invited after the Cloudflare deployment gates, multi-device smoke test, database-integrity smoke test, participant-withdrawal procedure, audit-log verification, and recovery drill above have all passed and the results have been recorded.
+A family-internal alpha can run after CI passes. External households should be invited only after the Cloudflare deployment gates, multi-device smoke test, database-integrity test, withdrawal procedure, audit verification, and recovery drill above have passed and results have been recorded.

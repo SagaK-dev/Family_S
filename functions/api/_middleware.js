@@ -294,7 +294,9 @@ export function secureApiResponse(originalResponse) {
   const response = new Response(originalResponse.body, originalResponse);
   response.headers.set('Cache-Control', 'no-store');
   response.headers.set('Content-Security-Policy', "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  response.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
   response.headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  response.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
   response.headers.set('Referrer-Policy', 'no-referrer');
   response.headers.set('Strict-Transport-Security', 'max-age=31536000');
   response.headers.set('X-Content-Type-Options', 'nosniff');

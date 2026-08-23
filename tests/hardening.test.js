@@ -52,16 +52,26 @@ test('schema and migration enforce audit type immutability and indexed rate-limi
   }
 });
 
-test('health gate requires integrity triggers and advertises pilot-v3', () => {
+test('health gate requires integrity objects and advertises pilot-v4', () => {
   const source = read('../functions/api/health.js');
-  assert.match(source, /pilot-v3/);
+  assert.match(source, /pilot-v4/);
   for (const trigger of [
     'trg_reads_clamp_insert',
     'trg_reads_clamp_update',
     'trg_audit_events_type_insert',
     'trg_audit_events_type_update',
+    'trg_audit_events_guard_update',
+    'trg_audit_events_guard_delete',
   ]) {
     assert.match(source, new RegExp(trigger));
+  }
+  for (const index of [
+    'idx_auth_limits_window_started_at',
+    'idx_sessions_user_created',
+    'idx_messages_user',
+    'idx_reactions_user',
+  ]) {
+    assert.match(source, new RegExp(index));
   }
 });
 
