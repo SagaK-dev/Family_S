@@ -1,5 +1,6 @@
 export const USERNAME_RE = /^[a-z0-9_]{3,24}$/i;
 export const ALLOWED_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🙏'];
+export const D1_LIKE_PATTERN_MAX_BYTES = 50;
 
 export function normalizeUsername(value) {
   return String(value ?? '').trim().toLowerCase();
@@ -29,9 +30,22 @@ export function validateMessage(value) {
   return body;
 }
 
+export function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, char => `\\${char}`);
+}
+
+export function buildSearchPattern(value) {
+  const query = String(value ?? '').trim();
+  return query ? `%${escapeLike(query)}%` : '';
+}
+
 export function validateSearch(value) {
   const query = String(value ?? '').trim();
-  if (query.length > 100) throw new Error('Search text is too long.');
+  if (!query) return '';
+  const pattern = buildSearchPattern(query);
+  if (new TextEncoder().encode(pattern).byteLength > D1_LIKE_PATTERN_MAX_BYTES) {
+    throw new Error('Search text is too long for the database query.');
+  }
   return query;
 }
 
