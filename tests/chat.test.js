@@ -108,6 +108,12 @@ test('API middleware allows only explicit message routes', () => {
   assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
 });
 
+test('deployment health route is read-only and explicit', () => {
+  assert.equal(routeAllowed('GET', ['health']), true);
+  assert.equal(routeAllowed('POST', ['health']), false);
+  assert.equal(routeAllowed('GET', ['health', 'details']), false);
+});
+
 test('API middleware exposes hardened auth session controls only by POST', () => {
   for (const action of ['login', 'logout', 'logout-all', 'logout-others', 'change-password']) {
     assert.equal(routeAllowed('POST', ['auth', action]), true);
