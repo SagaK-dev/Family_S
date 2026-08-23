@@ -1,4 +1,5 @@
-import { ALLOWED_REACTIONS } from './shared/chat.js';
+import { ALLOWED_REACTIONS, validateSearch } from './shared/chat.js';
+import { MEMBER_POLL_EVERY, MESSAGE_POLL_MS, shouldSendReadMarker } from './shared/pilot.js';
 
 const app = document.querySelector('#app');
 const toastEl = document.querySelector('#toast');
@@ -13,6 +14,8 @@ const state = {
   search: '',
   pinned: false,
   pollTimer: null,
+  pollTicks: 0,
+  lastReadSentAt: 0,
   loading: false,
 };
 
@@ -127,7 +130,7 @@ function mountChat() {
           <h1 id="viewTitle">家族チャット</h1>
           <span class="spacer"></span>
           <form class="search" id="searchForm">
-            <input class="input" id="searchInput" placeholder="メッセージを検索" maxlength="100" aria-label="メッセージを検索">
+            <input class="input" id="searchInput" placeholder="メッセージを検索" maxlength="48" aria-label="メッセージを検索">
             <button class="btn" type="submit">検索</button>
           </form>
         </header>
@@ -183,7 +186,13 @@ async function refreshMessages(initial = false) {
     renderTimeline();
     if (state.messages.length && !state.search && !state.pinned) {
       const newest = state.messages[state.messages.length - 1];
-      api('/api/read', { method: 'POST', body: { lastMessageAt: newest.createdAt } }).catch(() => {});
+      if (shouldSendReadMarker(state.lastReadSentAt, newest.createdAt)) {
+        const marker = newest.createdAt;
+        state.lastReadSentAt = marker;
+        void api('/api/read', { method: 'POST', body: { lastMessageAt: marker } }).catch(() => {
+          if (state.lastReadSentAt === marker) state.lastReadSentAt = 0;
+        });
+      }
       if (initial) requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' }));
     }
   } catch (error) {
@@ -376,6 +385,12 @@ async function sendMessage(event) {
 async function submitSearch(event) {
   event.preventDefault();
   const query = app.querySelector('#searchInput').value.trim();
+  try {
+    validateSearch(query);
+  } catch {
+    toast('検索語が長すぎます。短くして検索してください。');
+    return;
+  }
   state.search = query;
   state.pinned = false;
   await refreshMessages();
@@ -501,6 +516,8 @@ function resetToLogin() {
   state.user = null;
   state.messages = [];
   state.members = [];
+  state.lastReadSentAt = 0;
+  state.pollTicks = 0;
   stopPolling();
   document.querySelectorAll('.modal-backdrop').forEach(node => node.remove());
   renderAuth('login');
@@ -508,11 +525,13 @@ function resetToLogin() {
 
 function startPolling() {
   stopPolling();
+  state.pollTicks = 0;
   state.pollTimer = setInterval(() => {
     if (document.visibilityState !== 'visible' || state.search || state.pinned) return;
-    refreshMessages(false);
-    refreshMembers();
-  }, 2500);
+    state.pollTicks += 1;
+    void refreshMessages(false);
+    if (state.pollTicks % MEMBER_POLL_EVERY === 0) void refreshMembers();
+  }, MESSAGE_POLL_MS);
 }
 
 function stopPolling() {
@@ -521,7 +540,10 @@ function stopPolling() {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && state.user && !state.search && !state.pinned) refreshAll(false);
+  if (document.visibilityState === 'visible' && state.user && !state.search && !state.pinned) {
+    state.pollTicks = 0;
+    void refreshAll(false);
+  }
 });
 
 async function api(path, options = {}) {
