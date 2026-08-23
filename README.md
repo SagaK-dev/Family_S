@@ -2,80 +2,70 @@
 
 Family S is a private, family-only web chat for a small trusted group. It runs on Cloudflare Pages Functions + D1 and has no runtime npm dependencies.
 
-The application uses a chronological timeline with replies, reactions, search, read markers, owner controls, single-use invitations, participant withdrawal/data deletion, and a privacy-safe administrative audit trail. It does not contain public profiles, recommendation feeds, ads, or analytics.
+It provides a chronological family timeline with replies, reactions, search, read markers, owner controls, single-use invitations, participant withdrawal/data deletion, and a privacy-safe administrative audit trail.
 
-## Important privacy boundary
+## Privacy boundary
 
-Family S is **not end-to-end encrypted**. Message bodies are stored as plaintext in the configured Cloudflare D1 database so the server can perform search, reply-context, and timeline queries. Anyone with sufficient Cloudflare/D1 administrative access may be able to read those messages.
+Family S is **not end-to-end encrypted**. Message bodies are stored as plaintext in Cloudflare D1 so the server can perform search, reply-context, and timeline queries. Anyone with sufficient Cloudflare/D1 administrative access may be able to read those messages.
 
-Do not describe Family S to pilot participants as zero-knowledge or end-to-end encrypted. Application-level deletion also does not imply immediate erasure from D1 Time Travel/disaster-recovery history; the pilot privacy notice must describe that retention accurately.
+Application-level deletion also does not imply immediate erasure from D1 Time Travel/disaster-recovery history. Pilot consent/privacy text must describe that retention accurately.
 
-## Features
+## Security highlights
 
-- username + password authentication
-- exactly one family owner, enforced by D1
-- first-owner bootstrap protected by `FAMILY_SETUP_SECRET`
-- owner-generated single-use invitations that expire after **1 hour**
-- active-invite listing and revocation
-- member disable/re-enable with immediate session revocation
-- participant self-service withdrawal/data deletion with password re-authentication and explicit `DELETE` confirmation
-- owner-confirmed participant deletion for withdrawal cases where self-service is unavailable
-- owner-only audit-log view for security/administrative events
-- audit events never store passwords, message bodies, invitation codes, cookies, session tokens, or request bodies
-- audit event types are allowlisted in code and enforced by D1 triggers
-- PBKDF2-HMAC-SHA256 password hashing, 600,000 iterations for current hashes
-- legacy 240,000-iteration hashes upgrade after successful login
-- 30-day random bearer sessions stored only as SHA-256 hashes
-- `__Host-family_s_session` cookie with `HttpOnly`, `Secure`, `SameSite=Strict`, and `Path=/`
-- logout current session, logout other devices, and logout all devices
-- password change with re-authentication, rate limiting, session rotation, and audit logging
-- sensitive password-confirmation actions have separate per-user/IP rate limits
-- message creation uses an atomic D1 write limiter: **12 messages per 10 seconds per authenticated user**
-- chronological messages, replies, reactions, edit/delete, and owner pinning
-- bounded search compatible with Cloudflare D1's `LIKE` pattern limit
-- aggregate read/seen state with database clamping
-- PWA shell; `/api/` is never service-worker cached
-- public `/api/health` endpoint that verifies the required pilot D1 tables and integrity triggers
+- PBKDF2-HMAC-SHA256 passwords at 600,000 iterations; legacy 240,000-iteration hashes upgrade after successful login
+- unknown-user login attempts perform dummy PBKDF2 work to reduce username-enumeration timing differences
+- atomic D1 login throttles for IP-wide and IP+username buckets
+- dedicated rate limits for password-confirmation operations
+- `__Host-family_s_session` cookie with `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`
+- session tokens contain 256 random bits and only SHA-256 hashes are stored
+- **maximum 8 active sessions per user**; older sessions are pruned transactionally when a new session is issued
+- all core auth endpoints use exact Pages Function routes (`me`, `bootstrap`, `register`, `login`, logout variants, password change, account deletion)
+- owner-generated invites use 192 random bits, expire after 1 hour, are single use, and store only a hash
+- invite registration uses a unique temporary `invite_claims` record inside one D1 batch so concurrent registration and username failures cannot leave a half-consumed invite
+- participant self-deletion and owner-assisted member deletion require password re-authentication plus explicit `DELETE`
+- member disable immediately revokes that member's sessions
+- message creation has an atomic D1 limiter: 12 attempts per authenticated user per 10-second window
+- JSON request bodies are capped at 16 KiB before downstream execution
+- search is bounded by D1's 50-byte `LIKE` pattern limit after escaping and UTF-8 encoding
+- audit event types are allowlisted in application code and D1
+- audit history is append-only at the D1 layer; arbitrary updates/deletes are rejected, while participant deletion may anonymize actor/subject references to `NULL`
+- API responses use no-store, restrictive CSP, COOP, CORP, Permissions Policy, HSTS, frame denial, `nosniff`, no-referrer, and no-index headers
+- service worker never caches `/api/`
+- CI scans the current tree and complete Git history for common credential leaks
 
 ## Pilot polling policy
 
-For a limited pilot, the visible-tab client uses conservative polling:
+For a limited pilot:
 
-- message refresh: every **10 seconds**
-- member refresh: every **60 seconds**
-- read-marker write: only when the newest message timestamp advances
-- polling pauses while the tab is hidden and while search/pinned views are active
+- messages refresh every **10 seconds** while the tab is visible
+- members refresh every **60 seconds**
+- read markers are written only when the newest message advances
+- polling pauses when the tab is hidden and during search/pinned views
 
-The request-budget regression test models three users keeping the chat visible for four hours at about **5,046 idle refresh requests**, before user-generated actions. This is a planning model, not a production load test.
+The source-level request-budget regression models 3 users leaving the chat visible for 4 hours at about **5,046 idle refresh requests**, before user-generated actions. This is a planning model, not a production load test.
 
 ## Architecture
 
 ```text
-Browser
-  ├─ index.html / styles.css / app.js
-  ├─ pilot-controls.js
-  ├─ 10 s visible-tab message polling
-  ├─ 60 s member polling
-  └─ service worker for static shell only
-          │
-          ▼
+Browser / PWA
+        │
+        ▼
 Cloudflare Pages Functions
   ├─ functions/api/_middleware.js
   ├─ functions/api/_security.js
   ├─ functions/api/health.js
   ├─ functions/api/audit.js
-  ├─ functions/api/auth/change-password.js
-  ├─ functions/api/auth/delete-account.js
-  ├─ functions/api/auth/logout-all.js
+  ├─ functions/api/auth/*.js       # exact auth routes
   ├─ functions/api/members/[id]/delete.js
-  └─ functions/api/[[path]].js
-          │
-          ▼
+  └─ functions/api/[[path]].js    # remaining chat API
+        │
+        ▼
 Cloudflare D1
   ├─ users
   ├─ sessions
   ├─ blocked_users
   ├─ invites
+  ├─ invite_claims
   ├─ messages
   ├─ reactions
   ├─ reads
@@ -83,76 +73,21 @@ Cloudflare D1
   └─ audit_events
 ```
 
-`shared/chat.js` contains validation, D1-safe search-pattern construction, cursor handling, reaction aggregation, and timeline processing. `shared/pilot.js` contains pilot polling constants and request-budget helpers.
+`shared/chat.js` contains validation, D1-safe search construction, cursor handling, reaction aggregation, and timeline processing. `shared/pilot.js` contains pilot polling constants and request-budget helpers.
 
-## Security model
+## Audit and participant deletion
 
-### Passwords and sessions
+`audit_events` contains only event metadata:
 
-- current password hashes: PBKDF2-HMAC-SHA256, 600,000 iterations, random 16-byte salt, 256-bit output
-- legacy 240,000-iteration hashes remain readable and upgrade after successful login
-- unknown-user login attempts perform a dummy PBKDF2 operation to reduce username-enumeration timing differences
-- login throttling uses atomic D1 counters for both IP-wide and IP+username buckets
-- password-confirmation operations such as password change and account deletion use additional atomic rate-limit buckets
-- stale rate-limit rows are pruned and `window_started_at` is indexed to keep cleanup bounded
-- session tokens contain 256 random bits and only their SHA-256 hashes are stored in D1
-- only v2 session tokens are accepted
-- users can revoke other sessions or every session
-- password changes revoke old sessions and issue a fresh session
-- owner can disable a member; disabling immediately deletes that member's sessions
+- event id/type
+- actor/subject user references when they still exist
+- timestamp
 
-### Participant deletion
+It must never contain passwords, message bodies, invite codes, cookies, session tokens, or request bodies.
 
-A member can delete their own account by re-entering the current password and typing `DELETE`. The sole owner cannot self-delete through this endpoint.
+D1 triggers reject unknown audit event types, prevent event type/time/id modification, and reject audit-row deletion. The only user-reference transition allowed after insertion is non-null → `NULL`, which permits `ON DELETE SET NULL` to anonymize a participant after account deletion.
 
-The owner can delete a member after re-entering the owner password and typing `DELETE`. This is intended for confirmed participant-withdrawal requests.
-
-Deleting a member row causes the current foreign-key rules to remove that participant's sessions, authored messages, reactions, read marker, blocked-member record, and dependent invitation data. References from surviving audit rows are set to `NULL` so a minimal event/timestamp history can remain without retaining the deleted participant identity.
-
-D1 Time Travel may still hold a restorable historical database state for its configured retention window. See `PILOT_READINESS.md`.
-
-### Privacy-safe audit log
-
-`audit_events` stores only:
-
-- event identifier
-- event type
-- actor user reference when still present
-- subject user reference when still present
-- event timestamp
-
-The owner-only `GET /api/audit` endpoint resolves current display names for convenience. It does not return credentials, message contents, invite codes, session values, or request bodies.
-
-Audit event types are constrained twice: application code rejects unknown event types, and D1 triggers reject unknown inserts and make `event_type` immutable after creation. Foreign-key nulling of actor/subject references after participant deletion remains allowed.
-
-### Browser and API controls
-
-- mutating requests reject cross-origin `Origin` and cross-site `Sec-Fetch-Site`
-- API routes and methods are explicitly allowlisted
-- JSON endpoints require `Content-Type: application/json`
-- request bodies are capped at 16 KiB before downstream execution
-- message creation has an atomic per-user D1 rate limit so parallel requests cannot bypass the previous count-then-insert guard
-- message/invite/member IDs are validated
-- search patterns are checked against D1's 50-byte `LIKE` pattern limit after SQL escaping and UTF-8 encoding
-- static CSP uses `base-uri 'none'` and `form-action 'none'`, preventing fallback form submissions if JavaScript fails
-- static assets remove the default cross-origin access header and set `Cross-Origin-Resource-Policy: same-origin`
-- API responses are normalized in middleware with no-store, CSP, HSTS, frame denial, `nosniff`, no-referrer, same-origin resource policy, and no-index headers
-- service worker excludes `/api/`
-- security-route errors use structured logs without serializing request bodies or credentials
-
-See [SECURITY.md](SECURITY.md) for the security boundary and [PILOT_READINESS.md](PILOT_READINESS.md) for the pilot go/no-go checklist.
-
-## Secrets
-
-Never commit real credentials. `.gitignore` excludes `.dev.vars`, `.env`, private keys, service-account files, and common credential files. CI scans both the current tree and Git history.
-
-Required production secret:
-
-```text
-FAMILY_SETUP_SECRET
-```
-
-Use a long random value stored as a Cloudflare encrypted secret. Never put the real value in source, HTML, a public environment variable, or a GitHub issue.
+Deleting a member cascades through the current foreign keys to remove that participant's sessions, authored messages, reactions, read marker, blocked-member row, dependent invitations, and temporary invite claims. D1 Time Travel can still retain a restorable historical database state during its retention window.
 
 ## Cloudflare deployment
 
@@ -162,51 +97,42 @@ Create a D1 database and apply the current `schema.sql`.
 
 ### Existing D1 database
 
-Apply any migrations not yet present, including:
+Apply every migration not already present, in order:
 
 ```text
 migrations/0002_security_hardening.sql
 migrations/0003_pilot_audit.sql
 migrations/0004_runtime_hardening.sql
+migrations/0005_session_audit_hardening.sql
 ```
 
-Migration `0004_runtime_hardening.sql` adds the rate-limit cleanup index plus D1 audit-event allowlist/immutability triggers.
+Migration `0005_session_audit_hardening.sql` adds:
 
-### Bindings
+- `invite_claims` for concurrency-safe invite consumption
+- the session-pruning/lifecycle foreign-key indexes
+- append-only audit update/delete guards
 
-Bind D1 to the Pages project as:
-
-```text
-FAMILY_DB
-```
-
-Set `FAMILY_SETUP_SECRET` as an encrypted Cloudflare secret.
+Bind the D1 database as `FAMILY_DB` and store `FAMILY_SETUP_SECRET` as an encrypted Cloudflare secret. Never commit the real secret.
 
 ### Health check
 
-After deployment, request:
+After deployment:
 
 ```text
 GET /api/health
 ```
 
-A pilot-ready schema returns HTTP 200 with:
+A correctly upgraded pilot database returns HTTP 200:
 
 ```json
-{"ok":true,"schema":"pilot-v3"}
+{"ok":true,"schema":"pilot-v4"}
 ```
 
-HTTP 503 means the D1 binding is missing, a required table is missing, or one of the required integrity triggers is not installed. The endpoint intentionally exposes no row counts, usernames, messages, or other family data.
-
-### Observability
-
-Enable Pages/Workers logs before inviting pilot participants. For a small pilot, `PILOT_READINESS.md` recommends beginning with full head sampling so CPU-limit, D1, authentication, and audit-write failures can be diagnosed. Logs must not be used to record message bodies, passwords, invitation codes, cookies, or request payloads.
-
-Cloudflare's current Workers guidance recommends structured logs, current runtime compatibility settings, and avoiding floating promises. This project keeps security-critical writes awaited; post-response work should only be introduced through `waitUntil()` when the response does not depend on it.
+HTTP 503 means the binding or one of the required tables, triggers, or indexes is missing. The endpoint exposes no family row data.
 
 ## Verification
 
-Node.js 22+ is used for repository checks.
+Node.js 22+:
 
 ```bash
 npm test
@@ -216,50 +142,30 @@ npm run security:check
 npm run security:history
 ```
 
-The password benchmark confirms that the 600k PBKDF2 path actually runs in CI; its elapsed wall-clock time is **not** a substitute for Cloudflare Workers CPU measurements.
+`npm run check` recursively syntax-checks JavaScript/MJS under the app, `shared/`, `functions/`, `scripts/`, and `tests/`, validates the manifest and `_routes.json`, and checks the migration set. New route files therefore cannot silently fall outside the syntax gate.
 
-Automated coverage includes:
+Automated coverage includes validation/search/cursors/reactions, explicit routes, oversized-body rejection, password hash migration, session-cookie policy, polling budget, atomic message throttling, audit allowlisting/immutability, append-only audit guards, session cap, exact auth routes, concurrency-safe invitation claims, security headers, required lifecycle indexes, and `pilot-v4` health integrity.
 
-- username/display-name/password/message validation
-- D1-safe ASCII, Japanese, and escaped-wildcard search bounds
-- reaction allowlisting
-- cursor round-trip/rejection
-- timeline ordering/deduplication/page bounds
-- exact route/method allowlisting for health, audit, withdrawal, and member lifecycle controls
-- oversized JSON rejection before downstream execution
-- legacy/current password-hash parsing
-- host-only session cookie name
-- pilot request-budget regression
-- read-marker write deduplication
-- audit schema/migration invariants
-- audit event type allowlisting and immutability
-- static fallback-form blocking and same-origin resource policy
-- API security-header normalization while preserving `Set-Cookie`
-- atomic message-write throttling policy
-- current-tree and full-Git-history secret scanning
-
-CI runs on an explicit Ubuntu 24.04 image, uses read-only repository permissions, pins third-party actions to full commit SHAs, disables persisted checkout credentials, and cancels superseded runs on the same ref.
+The PBKDF2 benchmark confirms the 600k path actually executes in CI. Its wall-clock time is **not** a substitute for Cloudflare Workers CPU measurement.
 
 ## Pilot readiness
 
-A green GitHub Actions run verifies source-level behavior, but it does **not** prove the target Cloudflare account is ready.
+A green repository CI is necessary but not sufficient for external households. Complete [PILOT_READINESS.md](PILOT_READINESS.md), including:
 
-Before inviting external households, complete `PILOT_READINESS.md`, including:
+- apply migration 0005 to an existing deployment
+- verify live `/api/health` returns `pilot-v4`
+- measure login/register/password-change/delete CPU behavior in the actual Pages deployment
+- inspect Functions logs for CPU-limit, D1, and audit failures
+- verify actual static/API response headers
+- run owner/member multi-device E2E
+- test simultaneous invitation registration and session-cap behavior
+- test participant withdrawal and append-only audit behavior on staging
+- perform a D1 Time Travel recovery drill
+- enable Cloudflare MFA and least-privilege access
+- enable GitHub secret scanning/push protection where available
+- protect `main` with required CI checks
 
-- actual Pages + D1 deployment and `pilot-v3` health check
-- production-like login/register/password-change/self-delete/member-delete measurements
-- check for Workers CPU-limit and D1 errors in Pages Functions logs
-- owner/member tests on at least two devices or browsers
-- invite reuse/revocation tests
-- session revocation and member-disable tests
-- audit-log access/privacy tests
-- participant withdrawal/data deletion drill
-- D1 Time Travel restore drill on a disposable staging/pilot database
-- Cloudflare MFA and least-privilege access
-- GitHub push protection/secret scanning where available
-- protected `main` with required CI checks
-
-Because current password hashing uses 600,000 PBKDF2 iterations, do not assume the Workers Free 10 ms CPU allowance is sufficient. Use a suitable Cloudflare plan for the pilot unless measurements in the actual deployment demonstrate reliable operation.
+Because password hashing uses 600,000 PBKDF2 iterations, do not assume the Workers Free CPU allowance is sufficient. Measure it in the actual deployment or use an appropriate paid plan for the pilot.
 
 ## Project structure
 
@@ -267,10 +173,6 @@ Because current password hashing uses 600,000 PBKDF2 iterations, do not assume t
 Family_S/
 ├─ app.js
 ├─ pilot-controls.js
-├─ index.html
-├─ styles.css
-├─ icon.svg
-├─ manifest.webmanifest
 ├─ sw.js
 ├─ _headers
 ├─ _routes.json
@@ -280,31 +182,31 @@ Family_S/
 ├─ migrations/
 │  ├─ 0002_security_hardening.sql
 │  ├─ 0003_pilot_audit.sql
-│  └─ 0004_runtime_hardening.sql
+│  ├─ 0004_runtime_hardening.sql
+│  └─ 0005_session_audit_hardening.sql
 ├─ shared/
-│  ├─ chat.js
-│  └─ pilot.js
-├─ functions/
-│  └─ api/
-│     ├─ _middleware.js
-│     ├─ _security.js
-│     ├─ [[path]].js
-│     ├─ health.js
-│     ├─ audit.js
-│     ├─ auth/
-│     │  ├─ change-password.js
-│     │  ├─ delete-account.js
-│     │  └─ logout-all.js
-│     └─ members/[id]/delete.js
+├─ functions/api/
+│  ├─ _middleware.js
+│  ├─ _security.js
+│  ├─ [[path]].js
+│  ├─ health.js
+│  ├─ audit.js
+│  ├─ auth/
+│  │  ├─ me.js
+│  │  ├─ bootstrap.js
+│  │  ├─ register.js
+│  │  ├─ login.js
+│  │  ├─ logout.js
+│  │  ├─ logout-others.js
+│  │  ├─ logout-all.js
+│  │  ├─ change-password.js
+│  │  └─ delete-account.js
+│  └─ members/[id]/delete.js
 ├─ scripts/
+│  ├─ check-syntax.mjs
 │  ├─ benchmark-password.mjs
 │  └─ check-secrets.mjs
-├─ tests/
-│  ├─ chat.test.js
-│  └─ hardening.test.js
-└─ .github/workflows/ci.yml
+└─ tests/
 ```
 
-## Scope
-
-Family S is not a clone of X/Twitter. Public X/Twitter architecture was used only as study material for pipeline decomposition, feed ordering, filtering, conversation context, and pagination. No proprietary systems, private data, UI assets, brand elements, or source text are copied.
+See [SECURITY.md](SECURITY.md) for the security boundary and [PILOT_READINESS.md](PILOT_READINESS.md) for the pilot go/no-go checklist.
