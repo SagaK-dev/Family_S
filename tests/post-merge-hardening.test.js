@@ -8,6 +8,7 @@ import {
   publicPilotUser,
   timingSafeTextEqual,
 } from '../functions/api/_security.js';
+import { secureApiResponse } from '../functions/api/_middleware.js';
 
 test('session creation is transactionally capped per user', async () => {
   const statements = [];
@@ -49,21 +50,24 @@ test('security helper compares setup secrets without direct text equality', asyn
   assert.equal(await timingSafeTextEqual('same-secret', 'different-secret'), false);
 });
 
-test('API helper sends isolation and feature-restriction headers', () => {
-  const response = pilotJson({ ok: true });
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.equal(response.headers.get('cross-origin-opener-policy'), 'same-origin');
-  assert.equal(response.headers.get('cross-origin-resource-policy'), 'same-origin');
-  assert.match(response.headers.get('permissions-policy') || '', /camera=\(\)/);
-  assert.match(response.headers.get('content-security-policy') || '', /form-action 'none'/);
+test('API helpers send uniform isolation and feature-restriction headers', () => {
+  for (const response of [pilotJson({ ok: true }), secureApiResponse(new Response('{}'))]) {
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.headers.get('cross-origin-opener-policy'), 'same-origin');
+    assert.equal(response.headers.get('cross-origin-resource-policy'), 'same-origin');
+    assert.match(response.headers.get('permissions-policy') || '', /camera=\(\)/);
+    assert.match(response.headers.get('content-security-policy') || '', /form-action 'none'/);
+  }
 });
 
-test('registration is an exact route and consumes invites transactionally', () => {
+test('registration claims and consumes invites transactionally', () => {
   const source = fs.readFileSync(new URL('../functions/api/auth/register.js', import.meta.url), 'utf8');
   assert.match(source, /FAMILY_DB\.batch/);
+  assert.match(source, /INSERT INTO invite_claims/);
+  assert.match(source, /claim_token/);
   assert.match(source, /UPDATE invites SET used_at/);
   assert.match(source, /INSERT INTO users/);
-  assert.match(source, /WHERE EXISTS/);
+  assert.match(source, /DELETE FROM invite_claims/);
   assert.doesNotMatch(source, /SELECT \* FROM invites/);
 });
 
@@ -86,6 +90,16 @@ test('audit history is append-only except foreign-key anonymization', () => {
   }
 });
 
+test('invite claim storage is unique and migration-backed', () => {
+  const schema = fs.readFileSync(new URL('../schema.sql', import.meta.url), 'utf8');
+  const migration = fs.readFileSync(new URL('../migrations/0005_session_audit_hardening.sql', import.meta.url), 'utf8');
+  for (const sql of [schema, migration]) {
+    assert.match(sql, /CREATE TABLE IF NOT EXISTS invite_claims/);
+    assert.match(sql, /code_hash TEXT PRIMARY KEY REFERENCES invites\(code_hash\) ON DELETE CASCADE/);
+    assert.match(sql, /claim_token TEXT NOT NULL UNIQUE/);
+  }
+});
+
 test('lifecycle foreign-key paths and session pruning are indexed', () => {
   const schema = fs.readFileSync(new URL('../schema.sql', import.meta.url), 'utf8');
   for (const index of [
@@ -100,9 +114,10 @@ test('lifecycle foreign-key paths and session pruning are indexed', () => {
   }
 });
 
-test('health gate requires v4 audit/session integrity objects', () => {
+test('health gate requires v4 audit/session/invite integrity objects', () => {
   const source = fs.readFileSync(new URL('../functions/api/health.js', import.meta.url), 'utf8');
   assert.match(source, /pilot-v4/);
+  assert.match(source, /invite_claims/);
   assert.match(source, /trg_audit_events_guard_update/);
   assert.match(source, /trg_audit_events_guard_delete/);
   assert.match(source, /idx_sessions_user_created/);
