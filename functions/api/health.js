@@ -1,6 +1,6 @@
 import { handlePilotError, pilotJson } from './_security.js';
 
-const REQUIRED_TABLES = ['users', 'sessions', 'blocked_users', 'invites', 'messages', 'reactions', 'reads', 'auth_limits', 'audit_events'];
+const REQUIRED_TABLES = ['users', 'sessions', 'blocked_users', 'invites', 'invite_claims', 'messages', 'reactions', 'reads', 'auth_limits', 'audit_events'];
 const REQUIRED_TRIGGERS = [
   'trg_reads_clamp_insert',
   'trg_reads_clamp_update',
