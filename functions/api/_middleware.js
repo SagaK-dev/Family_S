@@ -11,6 +11,7 @@ import { recordAudit, requirePilotUser } from './_security.js';
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const JSON_LIMIT = 16 * 1024;
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -44,11 +45,12 @@ export async function onRequest(context) {
     if (method !== 'GET' && expectsJson(method, parts)) {
       const type = request.headers.get('Content-Type') || '';
       if (!type.toLowerCase().startsWith('application/json')) return apiError(415, 'Content-Type must be application/json.');
-      const body = await request.clone().json();
+      const body = await readLimitedJson(request.clone());
       validatePayload(method, parts, body);
     }
   } catch (error) {
     if (error?.rateLimited) return apiError(429, 'Too many setup attempts. Try again later.');
+    if (error?.status === 413) return apiError(413, 'Request is too large.');
     if (parts[0] === 'auth' && parts[1] === 'login') return apiError(401, 'Invalid username or password.');
     return apiError(400, error instanceof Error ? error.message : 'Invalid request.');
   }
@@ -192,6 +194,44 @@ function auditDescriptor(method, parts) {
   if (parts[0] === 'messages' && parts.length === 2 && method === 'DELETE') return { eventType: 'message_deleted', subjectUserId: null };
   if (parts[0] === 'messages' && parts.length === 3 && parts[2] === 'pin' && method === 'POST') return { eventType: 'message_pin_changed', subjectUserId: null };
   return null;
+}
+
+async function readLimitedJson(request) {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (declared > JSON_LIMIT) {
+    const error = new Error('Request is too large.');
+    error.status = 413;
+    throw error;
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) return {};
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > JSON_LIMIT) {
+      await reader.cancel();
+      const error = new Error('Request is too large.');
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes) || '{}');
+  } catch {
+    throw new Error('Invalid JSON.');
+  }
 }
 
 async function consumeBootstrapAttempt(db, bucket) {
