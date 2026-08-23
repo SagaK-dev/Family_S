@@ -11,7 +11,10 @@ import { recordAudit, requirePilotUser } from './_security.js';
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_STALE_MS = 24 * 60 * 60 * 1000;
 const JSON_LIMIT = 16 * 1024;
+export const MESSAGE_WRITE_LIMIT = 12;
+export const MESSAGE_WRITE_WINDOW_MS = 10_000;
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -19,7 +22,7 @@ export async function onRequest(context) {
   const parts = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
   const method = request.method.toUpperCase();
 
-  if (method === 'OPTIONS') return context.next();
+  if (method === 'OPTIONS') return secureApiResponse(await context.next());
   if (!routeAllowed(method, parts)) return apiError(404, 'Not found.');
 
   if (method !== 'GET') {
@@ -48,9 +51,16 @@ export async function onRequest(context) {
       const body = await readLimitedJson(request.clone());
       validatePayload(method, parts, body);
     }
+
+    if (method === 'POST' && parts.length === 1 && parts[0] === 'messages' && env?.FAMILY_DB) {
+      const user = await requirePilotUser(request, env.FAMILY_DB);
+      await consumeMessageAttempt(env.FAMILY_DB, user.id);
+    }
   } catch (error) {
     if (error?.rateLimited) return apiError(429, 'Too many setup attempts. Try again later.');
+    if (error?.messageRateLimited) return apiError(429, 'You are sending messages too quickly.');
     if (error?.status === 413) return apiError(413, 'Request is too large.');
+    if ([401, 403, 429].includes(error?.status)) return apiError(error.status, error.message || 'Request rejected.');
     if (parts[0] === 'auth' && parts[1] === 'login') return apiError(401, 'Invalid username or password.');
     return apiError(400, error instanceof Error ? error.message : 'Invalid request.');
   }
@@ -73,7 +83,7 @@ export async function onRequest(context) {
       }
     }
   }
-  return response;
+  return secureApiResponse(response);
 }
 
 export function routeAllowed(method, parts) {
@@ -243,10 +253,35 @@ async function consumeBootstrapAttempt(db, bucket) {
       window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
     RETURNING attempts`)
     .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
-  if (Number(row?.attempts || 0) > 10) {
+  const attempts = Number(row?.attempts || 0);
+  if (attempts > 10) {
     const error = new Error('Rate limited');
     error.rateLimited = true;
     throw error;
+  }
+  if (attempts === 1) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - RATE_LIMIT_STALE_MS).run();
+  }
+}
+
+async function consumeMessageAttempt(db, userId) {
+  const now = Date.now();
+  const bucket = await sha256Hex(`message\n${userId}`);
+  const row = await db.prepare(`
+    INSERT INTO auth_limits (bucket_hash, attempts, window_started_at) VALUES (?, 1, ?)
+    ON CONFLICT(bucket_hash) DO UPDATE SET
+      attempts = CASE WHEN auth_limits.window_started_at + ? <= ? THEN 1 ELSE auth_limits.attempts + 1 END,
+      window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
+    RETURNING attempts`)
+    .bind(bucket, now, MESSAGE_WRITE_WINDOW_MS, now, MESSAGE_WRITE_WINDOW_MS, now, now).first();
+  const attempts = Number(row?.attempts || 0);
+  if (attempts > MESSAGE_WRITE_LIMIT) {
+    const error = new Error('Message rate limited');
+    error.messageRateLimited = true;
+    throw error;
+  }
+  if (attempts === 1) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - RATE_LIMIT_STALE_MS).run();
   }
 }
 
@@ -255,16 +290,22 @@ async function sha256Hex(value) {
   return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+export function secureApiResponse(originalResponse) {
+  const response = new Response(originalResponse.body, originalResponse);
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('Content-Security-Policy', "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  response.headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  response.headers.set('Referrer-Policy', 'no-referrer');
+  response.headers.set('Strict-Transport-Security', 'max-age=31536000');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+  response.headers.set('X-Frame-Options', 'DENY');
+  response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  return response;
+}
+
 function apiError(status, message) {
-  return new Response(JSON.stringify({ error: message }), {
+  return secureApiResponse(new Response(JSON.stringify({ error: message }), {
     status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
-      'Referrer-Policy': 'no-referrer',
-      'Strict-Transport-Security': 'max-age=31536000',
-      'X-Content-Type-Options': 'nosniff',
-    },
-  });
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  }));
 }
