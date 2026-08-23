@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at DESC, token_hash DESC);
 
 CREATE TABLE IF NOT EXISTS blocked_users (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS invites (
   used_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_invites_expiry ON invites(expires_at);
+CREATE INDEX IF NOT EXISTS idx_invites_created_by ON invites(created_by);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -50,6 +52,8 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_timeline ON messages(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(reply_to);
 CREATE INDEX IF NOT EXISTS idx_messages_pinned ON messages(pinned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_pinned_by ON messages(pinned_by);
 
 CREATE TABLE IF NOT EXISTS reactions (
   message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -59,6 +63,7 @@ CREATE TABLE IF NOT EXISTS reactions (
   PRIMARY KEY (message_id, user_id, emoji)
 );
 CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_reactions_user ON reactions(user_id);
 
 CREATE TABLE IF NOT EXISTS reads (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -100,6 +105,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_subject ON audit_events(subject_user_id, created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS trg_audit_events_type_insert
 BEFORE INSERT ON audit_events
@@ -124,4 +130,27 @@ BEFORE UPDATE OF event_type ON audit_events
 WHEN NEW.event_type != OLD.event_type
 BEGIN
   SELECT RAISE(ABORT, 'audit event type is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_events_guard_update
+BEFORE UPDATE ON audit_events
+WHEN NEW.id != OLD.id
+  OR NEW.event_type != OLD.event_type
+  OR NEW.created_at != OLD.created_at
+  OR NOT (
+    NEW.actor_user_id IS OLD.actor_user_id
+    OR (OLD.actor_user_id IS NOT NULL AND NEW.actor_user_id IS NULL)
+  )
+  OR NOT (
+    NEW.subject_user_id IS OLD.subject_user_id
+    OR (OLD.subject_user_id IS NOT NULL AND NEW.subject_user_id IS NULL)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'audit event is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_audit_events_guard_delete
+BEFORE DELETE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'audit event deletion is not allowed');
 END;
