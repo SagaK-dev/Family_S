@@ -22,7 +22,7 @@ import {
   estimateIdleRequests,
   shouldSendReadMarker,
 } from '../shared/pilot.js';
-import { routeAllowed } from '../functions/api/_middleware.js';
+import { onRequest as middlewareOnRequest, routeAllowed } from '../functions/api/_middleware.js';
 import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from '../functions/api/[[path]].js';
 
 test('normalizes and validates usernames', () => {
@@ -107,6 +107,41 @@ test('API middleware allows only explicit message routes', () => {
   assert.equal(routeAllowed('POST', ['messages', id, 'pin']), true);
   assert.equal(routeAllowed('PATCH', ['messages', id, 'unexpected']), false);
   assert.equal(routeAllowed('DELETE', ['messages', 'not-an-id']), false);
+});
+
+test('API middleware rejects JSON bodies above 16 KiB before downstream execution', async () => {
+  let downstreamCalled = false;
+  const oversized = new Request('https://family.example/api/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'x'.repeat(17_000) }),
+  });
+  const rejected = await middlewareOnRequest({
+    request: oversized,
+    env: {},
+    next: async () => {
+      downstreamCalled = true;
+      return new Response('{}', { status: 200 });
+    },
+  });
+  assert.equal(rejected.status, 413);
+  assert.equal(downstreamCalled, false);
+
+  const accepted = new Request('https://family.example/api/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body: 'hello family' }),
+  });
+  const passed = await middlewareOnRequest({
+    request: accepted,
+    env: {},
+    next: async () => {
+      downstreamCalled = true;
+      return new Response('{}', { status: 200 });
+    },
+  });
+  assert.equal(passed.status, 200);
+  assert.equal(downstreamCalled, true);
 });
 
 test('deployment health and audit routes are read-only and explicit', () => {
