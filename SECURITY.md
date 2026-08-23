@@ -9,6 +9,7 @@ Family S is a private family chat application, but it is **not end-to-end encryp
 - Login verification performs a fixed-cost dummy PBKDF2 operation for unknown users to reduce username-enumeration timing differences for current-format accounts.
 - Login throttling uses atomic D1 UPSERT operations for both an IP-wide bucket and an IP+username bucket.
 - Password-confirmation operations such as password change and participant deletion use separate atomic per-user/IP rate-limit buckets.
+- Expired rate-limit buckets are periodically pruned, and `auth_limits.window_started_at` is indexed so cleanup does not degrade into a full-table scan as the table grows.
 - Session tokens contain 256 random bits, are stored only as SHA-256 hashes in D1, and use the `__Host-family_s_session` cookie with `HttpOnly`, `Secure`, `SameSite=Strict`, and `Path=/`.
 - Only `v2.` session tokens are accepted. Sessions issued before the session-hardening release are rejected.
 - Users can invalidate every other session or every session.
@@ -37,6 +38,8 @@ Family S is a private family chat application, but it is **not end-to-end encryp
 
 It must not contain passwords, message bodies, invitation codes, cookies, session tokens, request bodies, or other message content.
 
+Audit event types are allowlisted in application code and enforced again by D1 triggers. Unknown event types are rejected, and `event_type` is immutable after insertion. Foreign-key nulling of actor/subject references after participant deletion remains allowed.
+
 The audit API is owner-only. General administrative audit writes are best-effort so an audit-table problem does not corrupt an already-successful ordinary operation. Destructive/password security routes that depend on auditability use D1 `batch()` so the security mutation and its audit write are transactional together.
 
 ## Invitations
@@ -49,18 +52,25 @@ The audit API is owner-only. General administrative audit writes are best-effort
 
 - Mutating requests reject cross-origin `Origin` values and cross-site `Sec-Fetch-Site` values.
 - JSON mutation routes require `Content-Type: application/json`.
-- CSP, frame denial, referrer restrictions, `nosniff`, HSTS, and a restrictive Permissions Policy are configured.
-- API responses are `Cache-Control: no-store` and the service worker never caches `/api/`.
+- Request bodies are capped at 16 KiB before downstream route execution.
+- Message creation uses an atomic D1 counter limited to 12 writes per 10-second window per authenticated user, so parallel requests cannot bypass the old count-then-insert check.
+- Static CSP uses `base-uri 'none'` and `form-action 'none'`; if client JavaScript fails, password-bearing forms cannot fall back to a normal browser form submission that could place credentials in a URL.
+- Static assets remove Pages' default cross-origin access header and set `Cross-Origin-Resource-Policy: same-origin`.
+- Static and API responses include no-index directives; this is a privacy signal for crawlers, not an authentication control.
+- API responses are normalized by middleware to `Cache-Control: no-store`, CSP, HSTS, frame denial, `nosniff`, no-referrer, same-origin resource policy, and no-index headers. Cloudflare Pages `_headers` does not apply to Pages Functions responses, so these headers are attached in function code as well.
+- The service worker never caches `/api/`.
 - Message IDs, member IDs, and invite IDs are validated and API routes/methods are explicitly allowlisted.
 - Read markers are validated and additionally clamped by D1 triggers.
 - Cursor input is length-bounded before Base64/JSON decoding.
 - D1 search patterns are bounded by escaped UTF-8 byte length so they stay within Cloudflare D1's `LIKE` pattern limit.
-- New pilot security routes emit structured error metadata containing route/method/CF-Ray/error class only; they do not serialize request bodies or credentials into logs.
+- Pilot security routes emit structured error metadata containing route/method/CF-Ray/error class only; they do not serialize request bodies or credentials into logs.
 
 ## Repository and CI controls
 
 - GitHub Actions are pinned to full commit SHAs.
 - Checkout uses `persist-credentials: false` and read-only repository permissions.
+- CI uses an explicit Ubuntu 24.04 runner instead of `ubuntu-latest` and cancels superseded runs for the same ref.
+- CI regression tests cover audit type allowlisting/immutability, rate-limit indexing, health-gate triggers, CSP fallback-form blocking, API response headers, and atomic message-write throttling.
 - CI scans both the current tree and complete Git history for common credential signatures and forbidden secret-bearing filenames.
 - Real `.env`, `.dev.vars`, private keys, service-account credentials, and API tokens must never be committed.
 
@@ -71,15 +81,16 @@ For an existing D1 database, apply any migrations not already applied:
 ```text
 migrations/0002_security_hardening.sql
 migrations/0003_pilot_audit.sql
+migrations/0004_runtime_hardening.sql
 ```
 
 A deployment with the current pilot schema should return:
 
 ```json
-{"ok":true,"schema":"pilot-v2"}
+{"ok":true,"schema":"pilot-v3"}
 ```
 
-from `GET /api/health`.
+from `GET /api/health`. The health gate now verifies the required tables **and** integrity triggers.
 
 ## Remaining operational controls
 
