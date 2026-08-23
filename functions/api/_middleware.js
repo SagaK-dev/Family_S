@@ -213,7 +213,7 @@ async function readLimitedJson(request) {
     if (done) break;
     total += value.byteLength;
     if (total > JSON_LIMIT) {
-      await reader.cancel();
+      void reader.cancel().catch(() => {});
       const error = new Error('Request is too large.');
       error.status = 413;
       throw error;
