@@ -1,7 +1,22 @@
 import { PBKDF2_ITERATIONS, SESSION_COOKIE, parsePasswordHash } from './[[path]].js';
 
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_STALE_MS = 24 * 60 * 60 * 1000;
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
+
+export const AUDIT_EVENT_TYPES = Object.freeze([
+  'password_changed',
+  'account_deleted',
+  'member_deleted',
+  'sessions_revoked_all',
+  'member_disabled',
+  'member_enabled',
+  'invite_created',
+  'invite_revoked',
+  'message_deleted',
+  'message_pin_changed',
+]);
+const AUDIT_EVENT_TYPE_SET = new Set(AUDIT_EVENT_TYPES);
 
 export async function requirePilotUser(request, db) {
   const token = cookieValue(request, SESSION_COOKIE);
@@ -49,7 +64,11 @@ export async function consumeSensitiveAttempt(request, db, userId, action, limit
       window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
     RETURNING attempts`)
     .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
-  if (Number(row?.attempts || 0) > limit) throw new PilotHttpError(429, 'Too many verification attempts. Try again later.');
+  const attempts = Number(row?.attempts || 0);
+  if (attempts > limit) throw new PilotHttpError(429, 'Too many verification attempts. Try again later.');
+  if (attempts === 1) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - RATE_LIMIT_STALE_MS).run();
+  }
   return bucket;
 }
 
@@ -69,6 +88,7 @@ export async function createPilotSession(db, userId) {
 }
 
 export async function recordAudit(db, eventType, actorUserId = null, subjectUserId = null) {
+  if (!AUDIT_EVENT_TYPE_SET.has(eventType)) throw new Error('Unsupported audit event type.');
   await db.prepare('INSERT INTO audit_events (id, event_type, actor_user_id, subject_user_id, created_at) VALUES (?, ?, ?, ?, ?)')
     .bind(crypto.randomUUID(), eventType, actorUserId, subjectUserId, Date.now()).run();
 }
@@ -83,10 +103,13 @@ export function pilotJson(payload, status = 200, extraHeaders = {}) {
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
-      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+      'Content-Security-Policy': "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      'Cross-Origin-Resource-Policy': 'same-origin',
       'Referrer-Policy': 'no-referrer',
       'Strict-Transport-Security': 'max-age=31536000',
       'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'X-Robots-Tag': 'noindex, nofollow, noarchive',
       ...extraHeaders,
     },
   });
