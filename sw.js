@@ -1,8 +1,12 @@
-const CACHE = 'family-s-v2';
-const STATIC = ['./','./index.html','./styles.css','./app.js','./shared/chat.js','./manifest.webmanifest','./icon.svg'];
+const CACHE = 'family-s-v3';
+const STATIC = ['./','./index.html','./styles.css','./app.js','./pilot-controls.js','./shared/chat.js','./shared/pilot.js','./manifest.webmanifest','./icon.svg'];
 
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(STATIC)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => keys.startsWith ? false : false))));
 });
 
 self.addEventListener('activate', event => {
