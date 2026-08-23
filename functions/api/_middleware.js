@@ -184,7 +184,6 @@ function validatePayload(method, parts, body) {
 }
 
 function auditDescriptor(method, parts) {
-  if (parts[0] === 'auth' && parts[1] === 'logout-all' && method === 'POST') return { eventType: 'sessions_revoked_all', subjectUserId: null };
   if (parts[0] === 'members' && parts[2] === 'disable') {
     return { eventType: method === 'POST' ? 'member_disabled' : 'member_enabled', subjectUserId: parts[1] };
   }
