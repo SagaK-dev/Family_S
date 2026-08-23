@@ -61,7 +61,7 @@ function enhancePilotControls() {
       deleteButton.className = 'btn small';
       deleteButton.dataset.pilotDeleteMember = memberId;
       deleteButton.textContent = '削除';
-      deleteButton.title = 'この参加者のアカウントと保存データを削除';
+      deleteButton.title = 'この参加者のアカウントとアプリ上の保存データを削除';
       actionButton.insertAdjacentElement('afterend', deleteButton);
     });
   }
@@ -92,7 +92,7 @@ function showDeleteAccountModal() {
   showPilotModal(`
     <span class="eyebrow">PARTICIPANT WITHDRAWAL</span>
     <h2>退会・データ削除</h2>
-    <p class="hint">この操作は取り消せません。あなたのセッション、投稿、リアクション、既読情報など、アカウントに紐づくデータを削除します。</p>
+    <p class="hint">この操作はアプリ上の通常操作では取り消せません。あなたのセッション、投稿、リアクション、既読情報など、アカウントに紐づくデータを削除します。Cloudflareの障害復旧履歴には保持期間中の過去状態が残る場合があります。</p>
     <form class="form" id="pilotDeleteAccountForm">
       <label>現在のパスワード<input class="input" name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label>
       <label>確認のため DELETE と入力<input class="input" name="confirmation" autocomplete="off" pattern="DELETE" required></label>
@@ -102,7 +102,7 @@ function showDeleteAccountModal() {
 
   document.querySelector('#pilotDeleteAccountForm')?.addEventListener('submit', async event => {
     event.preventDefault();
-    if (!confirm('本当に退会してアカウントと保存データを削除しますか？')) return;
+    if (!confirm('本当に退会して、アプリ上のアカウントと保存データを削除しますか？')) return;
     const button = event.currentTarget.querySelector('button[type="submit"]');
     button.disabled = true;
     try {
@@ -120,7 +120,7 @@ function showDeleteMemberModal(memberId, displayName, row) {
   showPilotModal(`
     <span class="eyebrow">OWNER DATA DELETION</span>
     <h2>${escapeHtml(displayName)} のデータを削除</h2>
-    <p class="hint">参加撤回など、削除依頼を確認した場合だけ使用してください。投稿・リアクション・既読・セッション等が削除されます。</p>
+    <p class="hint">参加撤回など、削除依頼を確認した場合だけ使用してください。投稿・リアクション・既読・セッション等のアプリ上のデータが削除されます。Cloudflareの障害復旧履歴には保持期間中の過去状態が残る場合があります。</p>
     <form class="form" id="pilotDeleteMemberForm">
       <label>オーナーの現在のパスワード<input class="input" name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label>
       <label>確認のため DELETE と入力<input class="input" name="confirmation" autocomplete="off" pattern="DELETE" required></label>
@@ -130,7 +130,7 @@ function showDeleteMemberModal(memberId, displayName, row) {
 
   document.querySelector('#pilotDeleteMemberForm')?.addEventListener('submit', async event => {
     event.preventDefault();
-    if (!confirm(`${displayName} のアカウントと保存データを完全に削除しますか？`)) return;
+    if (!confirm(`${displayName} のアカウントとアプリ上の保存データを削除しますか？`)) return;
     const button = event.currentTarget.querySelector('button[type="submit"]');
     button.disabled = true;
     try {
@@ -138,7 +138,7 @@ function showDeleteMemberModal(memberId, displayName, row) {
       await pilotApi(`/api/members/${encodeURIComponent(memberId)}/delete`, { method: 'POST', body: data });
       row?.remove();
       closePilotModals();
-      toast('参加者のアカウントと保存データを削除しました');
+      toast('参加者のアカウントとアプリ上の保存データを削除しました');
     } catch (error) {
       toast(error.message);
       button.disabled = false;
@@ -228,6 +228,6 @@ function toast(message) {
   if (!toastEl) return;
   toastEl.textContent = message;
   toastEl.classList.add('show');
-  clearTimeout(toastEl._pilotTimer);
-  toastEl._pilotTimer = setTimeout(() => toastEl.classList.remove('show'), 3000);
+  clearTimeout(toastEl._timer);
+  toastEl._timer = setTimeout(() => toastEl.classList.remove('show'), 3000);
 }
