@@ -38,6 +38,12 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE INDEX IF NOT EXISTS idx_invites_expiry ON invites(expires_at);
 CREATE INDEX IF NOT EXISTS idx_invites_created_by ON invites(created_by);
 
+CREATE TABLE IF NOT EXISTS invite_claims (
+  code_hash TEXT PRIMARY KEY REFERENCES invites(code_hash) ON DELETE CASCADE,
+  claim_token TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
