@@ -11,9 +11,15 @@ import {
   validateUsername,
 } from '../../shared/chat.js';
 
-const SESSION_COOKIE = 'family_s_session';
+export const SESSION_COOKIE = '__Host-family_s_session';
+export const PBKDF2_ITERATIONS = 600_000;
+const LEGACY_PBKDF2_ITERATIONS = 240_000;
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
 const JSON_LIMIT = 16 * 1024;
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const DUMMY_SALT = new Uint8Array([73, 28, 244, 11, 91, 167, 35, 214, 64, 202, 17, 121, 8, 99, 188, 51]);
+const DUMMY_DIGEST = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const INVITE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -33,8 +39,8 @@ export async function onRequest(context) {
     if (parts[0] === 'messages') return handleMessages(request, env.FAMILY_DB, user, parts.slice(1), url);
     if (parts[0] === 'reactions') return handleReactions(request, env.FAMILY_DB, user);
     if (parts[0] === 'read') return handleRead(request, env.FAMILY_DB, user);
-    if (parts[0] === 'members') return handleMembers(request, env.FAMILY_DB, user);
-    if (parts[0] === 'invites') return handleInvites(request, env.FAMILY_DB, user);
+    if (parts[0] === 'members') return handleMembers(request, env.FAMILY_DB, user, parts.slice(1));
+    if (parts[0] === 'invites') return handleInvites(request, env.FAMILY_DB, user, parts.slice(1));
 
     return json({ error: 'Not found.' }, 404);
   } catch (error) {
@@ -79,10 +85,10 @@ async function handleAuth(request, env, parts) {
     if (!invite || invite.used_at || invite.expires_at <= now) throw new HttpError(400, 'Invite is invalid or expired.');
 
     const user = await createUser(env.FAMILY_DB, { username, displayName, password, role: 'member' });
-    const result = await env.FAMILY_DB.prepare('UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL').bind(now, codeHash).run();
+    const result = await env.FAMILY_DB.prepare('UPDATE invites SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?').bind(now, codeHash, now).run();
     if (!result.meta?.changes) {
       await env.FAMILY_DB.prepare('DELETE FROM users WHERE id = ?').bind(user.id).run();
-      throw new HttpError(409, 'Invite was already used.');
+      throw new HttpError(409, 'Invite was already used or expired.');
     }
     const cookie = await createSession(env.FAMILY_DB, user.id);
     return json({ user: publicUser(user) }, 201, { 'Set-Cookie': cookie });
@@ -92,17 +98,27 @@ async function handleAuth(request, env, parts) {
     const body = await readJson(request);
     const username = validateUsername(body.username);
     const password = String(body.password || '');
+    if (password.length < 1 || password.length > 128) throw new HttpError(401, 'Invalid username or password.');
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const bucket = await sha256Text(`${ip}\n${username}`);
-    await assertAuthRate(env.FAMILY_DB, bucket);
+    const ipBucket = await sha256Text(`ip\n${ip}`);
+    const credentialBucket = await sha256Text(`ip-user\n${ip}\n${username}`);
 
-    const user = await env.FAMILY_DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(username).first();
-    const valid = user ? await verifyPassword(password, user.password_salt, user.password_hash) : false;
-    if (!valid) {
-      await recordAuthFailure(env.FAMILY_DB, bucket);
-      throw new HttpError(401, 'Invalid username or password.');
+    await consumeAuthAttempt(env.FAMILY_DB, ipBucket, 60);
+    await consumeAuthAttempt(env.FAMILY_DB, credentialBucket, 10);
+
+    const user = await env.FAMILY_DB.prepare(`
+      SELECT u.* FROM users u
+      LEFT JOIN blocked_users b ON b.user_id = u.id
+      WHERE u.username = ? COLLATE NOCASE AND b.user_id IS NULL`).bind(username).first();
+    const verification = await verifyPasswordForLogin(password, user);
+    if (!verification.valid) throw new HttpError(401, 'Invalid username or password.');
+
+    await env.FAMILY_DB.prepare('DELETE FROM auth_limits WHERE bucket_hash = ?').bind(credentialBucket).run();
+    if (verification.needsUpgrade) {
+      const upgraded = await hashPassword(password);
+      await env.FAMILY_DB.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+        .bind(upgraded.hash, upgraded.salt, user.id).run();
     }
-    await env.FAMILY_DB.prepare('DELETE FROM auth_limits WHERE bucket_hash = ?').bind(bucket).run();
     const cookie = await createSession(env.FAMILY_DB, user.id);
     return json({ user: publicUser(user) }, 200, { 'Set-Cookie': cookie });
   }
@@ -111,6 +127,38 @@ async function handleAuth(request, env, parts) {
     const token = cookieValue(request, SESSION_COOKIE);
     if (token) await env.FAMILY_DB.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(await sha256Text(token)).run();
     return json({ ok: true }, 200, { 'Set-Cookie': clearSessionCookie() });
+  }
+
+  if (action === 'logout-others' && request.method === 'POST') {
+    const user = await requireUser(request, env.FAMILY_DB);
+    const token = requireSessionToken(request);
+    const tokenHash = await sha256Text(token);
+    await env.FAMILY_DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').bind(user.id, tokenHash).run();
+    return json({ ok: true });
+  }
+
+  if (action === 'logout-all' && request.method === 'POST') {
+    const user = await requireUser(request, env.FAMILY_DB);
+    await env.FAMILY_DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(user.id).run();
+    return json({ ok: true }, 200, { 'Set-Cookie': clearSessionCookie() });
+  }
+
+  if (action === 'change-password' && request.method === 'POST') {
+    const user = await requireUser(request, env.FAMILY_DB);
+    const body = await readJson(request);
+    const currentPassword = String(body.currentPassword || '');
+    const newPassword = validatePassword(body.newPassword);
+    if (currentPassword.length < 1 || currentPassword.length > 128 || currentPassword === newPassword) {
+      throw new HttpError(400, 'Invalid password change request.');
+    }
+    const verification = await verifyPassword(currentPassword, user.password_salt, user.password_hash);
+    if (!verification.valid) throw new HttpError(401, 'Current password is incorrect.');
+    const replacement = await hashPassword(newPassword);
+    await env.FAMILY_DB.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+      .bind(replacement.hash, replacement.salt, user.id).run();
+    await env.FAMILY_DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(user.id).run();
+    const cookie = await createSession(env.FAMILY_DB, user.id);
+    return json({ ok: true, user: publicUser(user) }, 200, { 'Set-Cookie': cookie });
   }
 
   throw new HttpError(404, 'Not found.');
@@ -219,10 +267,10 @@ async function handleMessages(request, db, user, parts, url) {
   if (request.method === 'POST' && parts[1] === 'pin') {
     if (user.role !== 'owner') throw new HttpError(403, 'Only the family owner can pin messages.');
     const body = await readJson(request);
-    const pinned = Boolean(body.pinned);
+    if (typeof body.pinned !== 'boolean') throw new HttpError(400, 'Pinned must be a boolean.');
     const message = await db.prepare('SELECT id FROM messages WHERE id = ? AND deleted_at IS NULL').bind(messageId).first();
     if (!message) throw new HttpError(404, 'Message not found.');
-    await db.prepare('UPDATE messages SET pinned_at = ?, pinned_by = ? WHERE id = ?').bind(pinned ? Date.now() : null, pinned ? user.id : null, messageId).run();
+    await db.prepare('UPDATE messages SET pinned_at = ?, pinned_by = ? WHERE id = ?').bind(body.pinned ? Date.now() : null, body.pinned ? user.id : null, messageId).run();
     return json({ ok: true });
   }
 
@@ -249,7 +297,7 @@ async function handleRead(request, db, user) {
   if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed.');
   const body = await readJson(request);
   const value = Number(body.lastMessageAt);
-  if (!Number.isSafeInteger(value) || value < 0 || value > Date.now() + 60_000) throw new HttpError(400, 'Invalid read marker.');
+  if (!Number.isSafeInteger(value) || value < 0 || value > Date.now()) throw new HttpError(400, 'Invalid read marker.');
   const now = Date.now();
   await db.prepare(`
     INSERT INTO reads (user_id, last_message_at, updated_at) VALUES (?, ?, ?)
@@ -259,32 +307,71 @@ async function handleRead(request, db, user) {
   return json({ ok: true });
 }
 
-async function handleMembers(request, db) {
-  if (request.method !== 'GET') throw new HttpError(405, 'Method not allowed.');
-  const result = await db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.role, u.created_at,
-           r.updated_at AS last_read_at
-    FROM users u LEFT JOIN reads r ON r.user_id = u.id
-    ORDER BY CASE u.role WHEN 'owner' THEN 0 ELSE 1 END, u.display_name COLLATE NOCASE`).all();
-  return json({ members: (result.results || []).map(row => ({
-    id: row.id,
-    username: row.username,
-    displayName: row.display_name,
-    role: row.role,
-    createdAt: row.created_at,
-    lastReadAt: row.last_read_at,
-  })) });
+async function handleMembers(request, db, user, parts) {
+  if (request.method === 'GET' && parts.length === 0) {
+    const result = await db.prepare(`
+      SELECT u.id, u.username, u.display_name, u.role, u.created_at,
+             r.updated_at AS last_read_at,
+             CASE WHEN b.user_id IS NULL THEN 0 ELSE 1 END AS disabled
+      FROM users u
+      LEFT JOIN reads r ON r.user_id = u.id
+      LEFT JOIN blocked_users b ON b.user_id = u.id
+      ORDER BY CASE u.role WHEN 'owner' THEN 0 ELSE 1 END, u.display_name COLLATE NOCASE`).all();
+    return json({ members: (result.results || []).map(row => ({
+      id: row.id,
+      username: row.username,
+      displayName: row.display_name,
+      role: row.role,
+      createdAt: row.created_at,
+      lastReadAt: row.last_read_at,
+      disabled: Boolean(row.disabled),
+    })) });
+  }
+
+  if (parts.length === 2 && parts[1] === 'disable' && (request.method === 'POST' || request.method === 'DELETE')) {
+    if (user.role !== 'owner') throw new HttpError(403, 'Only the family owner can manage members.');
+    const targetId = String(parts[0] || '');
+    const target = await db.prepare('SELECT id, role FROM users WHERE id = ?').bind(targetId).first();
+    if (!target || target.role === 'owner' || target.id === user.id) throw new HttpError(400, 'This member cannot be changed.');
+    if (request.method === 'POST') {
+      await db.prepare(`INSERT INTO blocked_users (user_id, disabled_at, disabled_by) VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET disabled_at = excluded.disabled_at, disabled_by = excluded.disabled_by`)
+        .bind(targetId, Date.now(), user.id).run();
+      await db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(targetId).run();
+      return json({ ok: true, disabled: true });
+    }
+    await db.prepare('DELETE FROM blocked_users WHERE user_id = ?').bind(targetId).run();
+    return json({ ok: true, disabled: false });
+  }
+
+  throw new HttpError(405, 'Method not allowed.');
 }
 
-async function handleInvites(request, db, user) {
-  if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed.');
-  if (user.role !== 'owner') throw new HttpError(403, 'Only the family owner can create invites.');
-  const rawCode = randomToken(24);
-  const codeHash = await sha256Text(rawCode);
+async function handleInvites(request, db, user, parts) {
+  if (user.role !== 'owner') throw new HttpError(403, 'Only the family owner can manage invites.');
   const now = Date.now();
-  const expiresAt = now + 24 * 60 * 60 * 1000;
-  await db.prepare('INSERT INTO invites (code_hash, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)').bind(codeHash, user.id, now, expiresAt).run();
-  return json({ inviteCode: rawCode, expiresAt }, 201);
+  if (request.method === 'GET' && parts.length === 0) {
+    const result = await db.prepare(`SELECT code_hash, created_at, expires_at
+      FROM invites WHERE used_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 50`).bind(now).all();
+    return json({ invites: (result.results || []).map(row => ({
+      id: row.code_hash,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    })) });
+  }
+  if (request.method === 'POST' && parts.length === 0) {
+    const rawCode = randomToken(24);
+    const codeHash = await sha256Text(rawCode);
+    const expiresAt = now + 60 * 60 * 1000;
+    await db.prepare('INSERT INTO invites (code_hash, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)').bind(codeHash, user.id, now, expiresAt).run();
+    return json({ inviteCode: rawCode, inviteId: codeHash, expiresAt }, 201);
+  }
+  if (request.method === 'DELETE' && parts.length === 1 && INVITE_ID_RE.test(parts[0])) {
+    const result = await db.prepare('DELETE FROM invites WHERE code_hash = ? AND used_at IS NULL').bind(parts[0]).run();
+    if (!result.meta?.changes) throw new HttpError(404, 'Active invite not found.');
+    return json({ ok: true });
+  }
+  throw new HttpError(405, 'Method not allowed.');
 }
 
 async function createUser(db, { username, displayName, password, role }) {
@@ -302,7 +389,7 @@ async function createUser(db, { username, displayName, password, role }) {
 }
 
 async function createSession(db, userId) {
-  const token = randomToken(32);
+  const token = `v2.${randomToken(32)}`;
   const tokenHash = await sha256Text(token);
   const createdAt = Date.now();
   const expiresAt = createdAt + SESSION_SECONDS * 1000;
@@ -315,6 +402,12 @@ function clearSessionCookie() {
   return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 }
 
+function requireSessionToken(request) {
+  const token = cookieValue(request, SESSION_COOKIE);
+  if (!token || !/^v2\.[A-Za-z0-9_-]{43}$/.test(token)) throw new HttpError(401, 'Authentication required.');
+  return token;
+}
+
 async function requireUser(request, db) {
   const user = await optionalUser(request, db);
   if (!user) throw new HttpError(401, 'Authentication required.');
@@ -323,11 +416,14 @@ async function requireUser(request, db) {
 
 async function optionalUser(request, db) {
   const token = cookieValue(request, SESSION_COOKIE);
-  if (!token) return null;
+  if (!token || !/^v2\.[A-Za-z0-9_-]{43}$/.test(token)) return null;
   const now = Date.now();
   const user = await db.prepare(`
-    SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ? AND s.expires_at > ?`).bind(await sha256Text(token), now).first();
+    SELECT u.* FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    LEFT JOIN blocked_users b ON b.user_id = u.id
+    WHERE s.token_hash = ? AND s.expires_at > ? AND b.user_id IS NULL`)
+    .bind(await sha256Text(token), now).first();
   return user || null;
 }
 
@@ -344,46 +440,63 @@ function publicUser(user) {
 async function hashPassword(password) {
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const salt = bytesToBase64Url(saltBytes);
-  return { salt, hash: await derivePassword(password, saltBytes) };
+  const digest = await derivePassword(password, saltBytes, PBKDF2_ITERATIONS);
+  return { salt, hash: `pbkdf2-sha256$${PBKDF2_ITERATIONS}$${digest}` };
+}
+
+export function parsePasswordHash(storedHash) {
+  const value = String(storedHash || '');
+  const match = /^pbkdf2-sha256\$(\d+)\$([A-Za-z0-9_-]{43})$/.exec(value);
+  if (match) {
+    const iterations = Number(match[1]);
+    if (!Number.isSafeInteger(iterations) || iterations < LEGACY_PBKDF2_ITERATIONS || iterations > 1_000_000) throw new Error('Invalid password hash parameters.');
+    return { iterations, digest: match[2], needsUpgrade: iterations < PBKDF2_ITERATIONS };
+  }
+  if (/^[A-Za-z0-9_-]{43}$/.test(value)) {
+    return { iterations: LEGACY_PBKDF2_ITERATIONS, digest: value, needsUpgrade: true };
+  }
+  throw new Error('Invalid password hash format.');
 }
 
 async function verifyPassword(password, salt, expectedHash) {
   try {
     const saltBytes = base64UrlToBytes(salt);
-    const actual = await derivePassword(password, saltBytes);
-    return constantTimeAscii(actual, expectedHash);
+    const parsed = parsePasswordHash(expectedHash);
+    const actual = await derivePassword(password, saltBytes, parsed.iterations);
+    return { valid: constantTimeAscii(actual, parsed.digest), needsUpgrade: parsed.needsUpgrade };
   } catch {
-    return false;
+    return { valid: false, needsUpgrade: false };
   }
 }
 
-async function derivePassword(password, saltBytes) {
+async function verifyPasswordForLogin(password, user) {
+  if (!user) {
+    const actual = await derivePassword(password, DUMMY_SALT, PBKDF2_ITERATIONS);
+    constantTimeAscii(actual, DUMMY_DIGEST);
+    return { valid: false, needsUpgrade: false };
+  }
+  return verifyPassword(password, user.password_salt, user.password_hash);
+}
+
+async function derivePassword(password, saltBytes, iterations) {
   const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: saltBytes, iterations: 240_000 }, keyMaterial, 256);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: saltBytes, iterations }, keyMaterial, 256);
   return bytesToBase64Url(new Uint8Array(bits));
 }
 
-async function assertAuthRate(db, bucket) {
+async function consumeAuthAttempt(db, bucket, limit) {
   const now = Date.now();
-  const windowMs = 15 * 60 * 1000;
-  const row = await db.prepare('SELECT attempts, window_started_at FROM auth_limits WHERE bucket_hash = ?').bind(bucket).first();
-  if (!row) return;
-  if (row.window_started_at + windowMs <= now) {
-    await db.prepare('DELETE FROM auth_limits WHERE bucket_hash = ?').bind(bucket).run();
-    return;
-  }
-  if (Number(row.attempts) >= 10) throw new HttpError(429, 'Too many login attempts. Try again later.');
-}
-
-async function recordAuthFailure(db, bucket) {
-  const now = Date.now();
-  const windowMs = 15 * 60 * 1000;
-  await db.prepare(`
+  const row = await db.prepare(`
     INSERT INTO auth_limits (bucket_hash, attempts, window_started_at) VALUES (?, 1, ?)
     ON CONFLICT(bucket_hash) DO UPDATE SET
       attempts = CASE WHEN auth_limits.window_started_at + ? <= ? THEN 1 ELSE auth_limits.attempts + 1 END,
-      window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END`)
-    .bind(bucket, now, windowMs, now, windowMs, now, now).run();
+      window_started_at = CASE WHEN auth_limits.window_started_at + ? <= ? THEN ? ELSE auth_limits.window_started_at END
+    RETURNING attempts, window_started_at`)
+    .bind(bucket, now, AUTH_WINDOW_MS, now, AUTH_WINDOW_MS, now, now).first();
+  if (Number(row?.attempts || 0) > limit) throw new HttpError(429, 'Too many login attempts. Try again later.');
+  if (Math.random() < 0.02) {
+    await db.prepare('DELETE FROM auth_limits WHERE window_started_at < ?').bind(now - 24 * 60 * 60 * 1000).run();
+  }
 }
 
 async function readJson(request) {
@@ -414,8 +527,9 @@ async function readJson(request) {
 
 function assertSameOrigin(request) {
   const origin = request.headers.get('Origin');
-  if (!origin) return;
-  if (origin !== new URL(request.url).origin) throw new HttpError(403, 'Cross-site request rejected.');
+  if (origin && origin !== new URL(request.url).origin) throw new HttpError(403, 'Cross-site request rejected.');
+  const fetchSite = request.headers.get('Sec-Fetch-Site');
+  if (fetchSite && !['same-origin', 'none'].includes(fetchSite)) throw new HttpError(403, 'Cross-site request rejected.');
 }
 
 function cookieValue(request, name) {
@@ -475,6 +589,7 @@ function apiHeaders(extra = {}) {
     'Cache-Control': 'no-store',
     'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
     'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=31536000',
     'X-Content-Type-Options': 'nosniff',
     ...extra,
   };

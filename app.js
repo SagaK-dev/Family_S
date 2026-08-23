@@ -71,7 +71,7 @@ function authForm(mode) {
   return `
     <form class="form">
       <label>ユーザー名<input class="input" name="username" autocomplete="username" required></label>
-      <label>パスワード<input class="input" name="password" type="password" autocomplete="current-password" required></label>
+      <label>パスワード<input class="input" name="password" type="password" autocomplete="current-password" maxlength="128" required></label>
       <button class="btn primary" type="submit">ログイン</button>
     </form>`;
 }
@@ -115,7 +115,8 @@ function mountChat() {
           <div id="memberList"></div>
         </section>
         <div class="sidebar-actions">
-          ${state.user.role === 'owner' ? '<button class="btn" id="createInvite">＋ 招待コードを作る</button>' : ''}
+          ${state.user.role === 'owner' ? '<button class="btn" id="createInvite">＋ 招待コードを作る</button><button class="btn" id="manageInvites">招待を管理</button>' : ''}
+          <button class="btn" id="security">🔐 セキュリティ</button>
           <button class="btn" id="showPinned">📌 固定メッセージ</button>
           <button class="btn" id="logout">ログアウト</button>
         </div>
@@ -144,11 +145,14 @@ function mountChat() {
     </div>`;
 
   app.querySelector('#logout').addEventListener('click', logout);
+  app.querySelector('#security').addEventListener('click', showSecurityModal);
   app.querySelector('#createInvite')?.addEventListener('click', createInvite);
+  app.querySelector('#manageInvites')?.addEventListener('click', manageInvites);
   app.querySelector('#showPinned').addEventListener('click', togglePinned);
   app.querySelector('#mobileMembers')?.addEventListener('click', showMembersModal);
   app.querySelector('#searchForm').addEventListener('submit', submitSearch);
   app.querySelector('#composer').addEventListener('submit', sendMessage);
+  app.querySelector('#memberList').addEventListener('click', handleMemberAction);
   app.querySelector('#messageInput').addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
@@ -227,10 +231,27 @@ function renderMembers() {
     <div class="member">
       <span class="avatar">${escapeHtml(initials(member.displayName))}</span>
       <div class="member-meta">
-        <strong>${escapeHtml(member.displayName)}</strong>
+        <strong>${escapeHtml(member.displayName)}${member.disabled ? ' · 停止中' : ''}</strong>
         <small>@${escapeHtml(member.username)}${member.role === 'owner' ? ' · owner' : ''}</small>
       </div>
+      ${state.user.role === 'owner' && member.role !== 'owner' ? `<button class="btn small" data-member-action="${member.disabled ? 'enable' : 'disable'}" data-member-id="${attr(member.id)}">${member.disabled ? '再開' : '停止'}</button>` : ''}
     </div>`).join('') || '<div class="hint">読み込み中…</div>';
+}
+
+async function handleMemberAction(event) {
+  const button = event.target.closest('[data-member-action]');
+  if (!button || state.user.role !== 'owner') return;
+  const member = state.members.find(item => item.id === button.dataset.memberId);
+  if (!member) return;
+  const disabling = button.dataset.memberAction === 'disable';
+  if (!confirm(`${member.displayName} のログインを${disabling ? '停止' : '再開'}しますか？${disabling ? ' 現在の全セッションも失効します。' : ''}`)) return;
+  try {
+    await api(`/api/members/${encodeURIComponent(member.id)}/disable`, { method: disabling ? 'POST' : 'DELETE' });
+    await refreshMembers();
+    toast(disabling ? 'メンバーを停止しました' : 'メンバーを再開しました');
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 function renderTimeline() {
@@ -374,7 +395,7 @@ async function createInvite() {
     showModal(`
       <span class="eyebrow">SINGLE-USE INVITE</span>
       <h2>家族を招待</h2>
-      <p class="hint">このコードは1回だけ使え、24時間で期限切れになります。安全な方法で家族本人に渡してください。</p>
+      <p class="hint">このコードは1回だけ使え、1時間で期限切れになります。安全な方法で家族本人に渡してください。</p>
       <div class="code-box">${escapeHtml(payload.inviteCode)}</div>
       <div style="display:flex;gap:8px;margin-top:14px">
         <button class="btn primary" id="copyInvite">コピー</button><button class="btn" data-close-modal>閉じる</button>
@@ -386,8 +407,79 @@ async function createInvite() {
   } catch (error) { toast(error.message); }
 }
 
+async function manageInvites() {
+  try {
+    const payload = await api('/api/invites');
+    const invites = payload.invites || [];
+    showModal(`
+      <span class="eyebrow">ACTIVE INVITES</span>
+      <h2>招待を管理</h2>
+      <p class="hint">不要になった招待はすぐに取り消せます。</p>
+      <div id="inviteList">${invites.length ? invites.map(invite => `
+        <div class="member">
+          <div class="member-meta"><strong>未使用の招待</strong><small>期限 ${escapeHtml(formatTime(invite.expiresAt))}</small></div>
+          <button class="btn small" data-revoke-invite="${attr(invite.id)}">取消</button>
+        </div>`).join('') : '<div class="hint">有効な招待はありません。</div>'}</div>
+      <button class="btn" data-close-modal style="margin-top:12px">閉じる</button>`);
+    document.querySelector('#inviteList')?.addEventListener('click', async event => {
+      const button = event.target.closest('[data-revoke-invite]');
+      if (!button || !confirm('この招待を取り消しますか？')) return;
+      try {
+        await api(`/api/invites/${encodeURIComponent(button.dataset.revokeInvite)}`, { method: 'DELETE' });
+        button.closest('.member')?.remove();
+        toast('招待を取り消しました');
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function showSecurityModal() {
+  showModal(`
+    <span class="eyebrow">ACCOUNT SECURITY</span>
+    <h2>セキュリティ</h2>
+    <form class="form" id="passwordForm">
+      <label>現在のパスワード<input class="input" name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label>
+      <label>新しいパスワード<input class="input" name="newPassword" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label>
+      <button class="btn primary" type="submit">パスワードを変更</button>
+    </form>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px">
+      <button class="btn" id="logoutOthers">他の端末をログアウト</button>
+      <button class="btn" id="logoutAll">全端末をログアウト</button>
+      <button class="btn" data-close-modal>閉じる</button>
+    </div>`);
+
+  document.querySelector('#passwordForm')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api('/api/auth/change-password', { method: 'POST', body: data });
+      event.currentTarget.reset();
+      toast('パスワードを変更し、他のセッションを失効しました');
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  document.querySelector('#logoutOthers')?.addEventListener('click', async () => {
+    try {
+      await api('/api/auth/logout-others', { method: 'POST', body: {} });
+      toast('他の端末をログアウトしました');
+    } catch (error) { toast(error.message); }
+  });
+  document.querySelector('#logoutAll')?.addEventListener('click', async () => {
+    if (!confirm('この端末を含む全端末からログアウトしますか？')) return;
+    try {
+      await api('/api/auth/logout-all', { method: 'POST', body: {} });
+    } catch {}
+    resetToLogin();
+  });
+}
+
 function showMembersModal() {
-  showModal(`<h2>家族メンバー</h2><div>${state.members.map(member => `<div class="member"><span class="avatar">${escapeHtml(initials(member.displayName))}</span><div class="member-meta"><strong>${escapeHtml(member.displayName)}</strong><small>@${escapeHtml(member.username)}${member.role === 'owner' ? ' · owner' : ''}</small></div></div>`).join('')}</div><button class="btn" data-close-modal style="margin-top:12px">閉じる</button>`);
+  showModal(`<h2>家族メンバー</h2><div>${state.members.map(member => `<div class="member"><span class="avatar">${escapeHtml(initials(member.displayName))}</span><div class="member-meta"><strong>${escapeHtml(member.displayName)}${member.disabled ? ' · 停止中' : ''}</strong><small>@${escapeHtml(member.username)}${member.role === 'owner' ? ' · owner' : ''}</small></div></div>`).join('')}</div><button class="btn" data-close-modal style="margin-top:12px">閉じる</button>`);
 }
 
 function showModal(content) {
@@ -402,10 +494,15 @@ function showModal(content) {
 
 async function logout() {
   try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {}
+  resetToLogin();
+}
+
+function resetToLogin() {
   state.user = null;
   state.messages = [];
   state.members = [];
   stopPolling();
+  document.querySelectorAll('.modal-backdrop').forEach(node => node.remove());
   renderAuth('login');
 }
 
